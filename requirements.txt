@@ -1,0 +1,8 @@
+# Core
+langgraph
+google-generativeai
+
+# Training (install on Colab, not locally)
+# unsloth
+# trl
+# datasets

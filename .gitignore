@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.DS_Store
+*.egg-info/
+data/train.jsonl
+data/test.jsonl
+analysis/figures/*.png
+risk_grpo_output/
+risk_grpo_final/
+.env
