@@ -183,6 +183,9 @@ def run_tool_loop(text: str, game=None, player=None,
     """
     tool_log = []
 
+    if text is None:
+        return "", tool_log
+
     for _ in range(max_calls):
         parsed = parse_tool_call(text)
         if parsed is None:

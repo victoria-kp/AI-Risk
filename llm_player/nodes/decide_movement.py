@@ -67,7 +67,7 @@ def decide_movement(state: dict) -> dict:
     prompt = MOVEMENT_PROMPT.format(board_summary=board_summary)
 
     # Get model output
-    raw_output = model.generate(prompt, max_tokens=1024, temperature=0.7)
+    raw_output = model.generate(prompt, max_tokens=10000, temperature=0.7, caller="movement") or ""
 
     # Process any tool calls
     processed_output, tool_log = run_tool_loop(
@@ -81,22 +81,25 @@ def decide_movement(state: dict) -> dict:
             f"{processed_output}\n\n"
             f"Now output your final movement decision as JSON."
         )
-        raw_output = model.generate(followup, max_tokens=512, temperature=0.3)
+        raw_output = model.generate(followup, max_tokens=10000, temperature=0.3, caller="movement_followup") or ""
 
     # Parse and validate
+    fallback = False
     decision = _parse_movement(raw_output)
     if decision is not None:
         decision = _validate_movement(decision, player, game)
-    elif decision is None and _parsed_as_skip(raw_output):
-        # Model explicitly chose to skip
+        if decision is None:
+            fallback = True
+    elif _parsed_as_skip(raw_output):
         decision = None
     else:
-        # Parsing failed — use fallback
         decision = _fallback_movement(player)
+        fallback = True
 
     return {
         "movement_decision": decision,
         "movement_raw": raw_output,
+        "movement_fallback": fallback,
     }
 
 

@@ -12,7 +12,11 @@ Usage:
 """
 
 import os
+import time
+import logging
 from typing import Optional
+
+LOG = logging.getLogger("llm_player.model")
 
 try:
     from dotenv import load_dotenv
@@ -38,6 +42,9 @@ class ModelBackend:
                  model_path: Optional[str] = None):
         self.backend_type = None
         self._model = None
+        self.call_count = 0
+        self.call_counts_by_caller = {}  # tracks calls per node
+        self.call_log = []  # records prompt/response/caller for each call
 
         if backend == "auto":
             # Try Qwen first, then Gemini
@@ -92,23 +99,29 @@ class ModelBackend:
         self.backend_type = "gemini"
 
     def generate(self, prompt: str, max_tokens: int = 512,
-                 temperature: float = 0.7) -> str:
+                 temperature: float = 0.7, caller: str = "") -> str:
         """Generate a text completion for the given prompt.
 
         Args:
             prompt: The full prompt string.
             max_tokens: Maximum tokens to generate.
             temperature: Sampling temperature (0.0 = deterministic).
+            caller: Label for tracking which node made the call.
 
         Returns:
             The model's text completion.
         """
+        self.call_count += 1
+        if caller:
+            self.call_counts_by_caller[caller] = self.call_counts_by_caller.get(caller, 0) + 1
         if self.backend_type == "qwen":
-            return self._generate_qwen(prompt, max_tokens, temperature)
+            result = self._generate_qwen(prompt, max_tokens, temperature)
         elif self.backend_type == "gemini":
-            return self._generate_gemini(prompt, max_tokens, temperature)
+            result = self._generate_gemini(prompt, max_tokens, temperature)
         else:
             raise RuntimeError("No backend initialized.")
+        self.call_log.append({"prompt": prompt, "response": result, "caller": caller})
+        return result
 
     def _generate_qwen(self, prompt: str, max_tokens: int,
                        temperature: float) -> str:
@@ -121,15 +134,34 @@ class ModelBackend:
     def _generate_gemini(self, prompt: str, max_tokens: int,
                          temperature: float) -> str:
         from google.genai import types
-        response = self._client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                max_output_tokens=max_tokens,
-                temperature=temperature,
-            ),
-        )
-        return response.text
+        max_retries = 20
+        for attempt in range(max_retries + 1):
+            try:
+                response = self._client.models.generate_content(
+                    model="gemini-2.5-flash-lite",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        max_output_tokens=max_tokens,
+                        temperature=temperature,
+                    ),
+                )
+                return response.text
+            except Exception as e:
+                err = str(e).lower()
+                retryable = (
+                    "429" in err or "rate" in err
+                    or "resource" in err or "quota" in err
+                    or "503" in err or "unavailable" in err
+                    or "500" in err or "server" in err
+                )
+                if attempt < max_retries and retryable:
+                    wait = 90  # wait for per-minute quota to reset
+                    LOG.warning("API error (attempt %d/%d), waiting %ds: %s",
+                                attempt + 1, max_retries, wait,
+                                str(e)[:100])
+                    time.sleep(wait)
+                else:
+                    raise
 
 
 class MockModelBackend:
@@ -149,7 +181,7 @@ class MockModelBackend:
         self.call_log = []
 
     def generate(self, prompt: str, max_tokens: int = 512,
-                 temperature: float = 0.7) -> str:
+                 temperature: float = 0.7, caller: str = "") -> str:
         """Return next predetermined response, or auto-detect from prompt."""
         self.call_log.append({
             "prompt": prompt,

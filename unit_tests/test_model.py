@@ -257,6 +257,9 @@ class TestModelBackendGenerate(unittest.TestCase):
             backend = ModelBackend.__new__(ModelBackend)
             backend.backend_type = None
             backend._model = None
+            backend.call_count = 0
+            backend.call_counts_by_caller = {}
+            backend.call_log = []
             with self.assertRaises(RuntimeError):
                 backend.generate("test")
 

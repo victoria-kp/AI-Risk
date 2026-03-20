@@ -67,7 +67,7 @@ def decide_attacks(state: dict) -> dict:
     prompt = ATTACK_PROMPT.format(board_summary=board_summary)
 
     # Get model output
-    raw_output = model.generate(prompt, max_tokens=1024, temperature=0.7)
+    raw_output = model.generate(prompt, max_tokens=10000, temperature=0.7, caller="attacks") or ""
 
     # Process any tool calls
     processed_output, tool_log = run_tool_loop(
@@ -81,9 +81,10 @@ def decide_attacks(state: dict) -> dict:
             f"{processed_output}\n\n"
             f"Now output your final attack decision as JSON."
         )
-        raw_output = model.generate(followup, max_tokens=512, temperature=0.3)
+        raw_output = model.generate(followup, max_tokens=10000, temperature=0.3, caller="attacks_followup") or ""
 
     # Parse and validate
+    fallback = False
     attacks = _parse_attacks(raw_output)
     if attacks is not None:
         attacks = _validate_attacks(attacks, player, game)
@@ -91,10 +92,12 @@ def decide_attacks(state: dict) -> dict:
     # Fallback if parsing or validation failed
     if attacks is None:
         attacks = _fallback_attacks()
+        fallback = True
 
     return {
         "attack_decisions": attacks,
         "attack_raw": raw_output,
+        "attack_fallback": fallback,
     }
 
 

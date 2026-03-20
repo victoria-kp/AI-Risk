@@ -2,6 +2,7 @@ from ai import AI
 import random
 from collections import defaultdict
 from copy import deepcopy
+from functools import reduce
 
 class ChronAI(AI):
     def pathfind(self, src, dest, forces=True, hostile=True):
@@ -300,7 +301,7 @@ class ChronAI(AI):
             self.loginfo("plan_attack: none found")
             return None
         
-        defended_possible = filter(lambda x: set(xx[-1] for xx in x) >= set(defenses.keys()), possible)
+        defended_possible = list(filter(lambda x: set(xx[-1] for xx in x) >= set(defenses.keys()), possible))
         if defended_possible:
             possible = defended_possible
 
@@ -337,7 +338,7 @@ class ChronAI(AI):
         if wanted > available:
             self.loginfo("reinforce: unable to meet defense requirement (%s/%s)", wanted, available)
             for i in range(wanted - available):
-                key = random.choice(result.keys())
+                key = random.choice(list(result.keys()))
                 result[key] -= 1
                 if result[key] == 0:
                     del result[key]

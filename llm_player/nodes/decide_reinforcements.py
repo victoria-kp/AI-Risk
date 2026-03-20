@@ -65,7 +65,7 @@ def decide_reinforcements(state: dict) -> dict:
     )
 
     # Get model output
-    raw_output = model.generate(prompt, max_tokens=1024, temperature=0.7)
+    raw_output = model.generate(prompt, max_tokens=10000, temperature=0.7, caller="reinforcements") or ""
 
     # Process any tool calls
     processed_output, tool_log = run_tool_loop(
@@ -79,9 +79,10 @@ def decide_reinforcements(state: dict) -> dict:
             f"{processed_output}\n\n"
             f"Now output your final reinforcement decision as JSON."
         )
-        raw_output = model.generate(followup, max_tokens=512, temperature=0.3)
+        raw_output = model.generate(followup, max_tokens=10000, temperature=0.3, caller="reinforcements_followup") or ""
 
     # Parse and validate
+    fallback = False
     decision = _parse_reinforcements(raw_output)
     if decision is not None:
         decision = _validate_reinforcements(decision, player, available)
@@ -89,10 +90,12 @@ def decide_reinforcements(state: dict) -> dict:
     # Fallback if parsing or validation failed
     if decision is None:
         decision = _fallback_reinforcements(player, available)
+        fallback = True
 
     return {
         "reinforcement_decision": decision,
         "reinforcement_raw": raw_output,
+        "reinforcement_fallback": fallback,
     }
 
 
