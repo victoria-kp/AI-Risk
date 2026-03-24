@@ -29,7 +29,7 @@ Usage:
     python training/train_grpo.py --cpu --max-steps 2 --num-generations 2 --max-examples 10
 
     # GPU training (Colab T4)
-    # Uses Qwen 2.5 3B 4-bit via Unsloth + QLoRA
+    # Uses Qwen 2.5 3B 4-bit via bitsandbytes + QLoRA
     python training/train_grpo.py --max-steps 200
 
     # Full training run
@@ -47,14 +47,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'pyrisk_vendor'
 from risk_env.tool_interface import run_tool_loop
 from training.reward import compute_reward
 
-# GPU-only imports (unsloth, trl, datasets) are deferred to the
+# GPU-only imports (trl, datasets, bitsandbytes) are deferred to the
 # functions that need them so that load_dataset() and reward_function()
 # remain importable on CPU-only machines (used by analysis/evaluate.py).
 
 
 # ── Defaults ──────────────────────────────────────────────────────────
 
-MODEL_GPU = "unsloth/Qwen2.5-3B-Instruct-bnb-4bit"
+MODEL_GPU = "Qwen/Qwen2.5-3B-Instruct"
 MODEL_CPU = "Qwen/Qwen2.5-0.5B-Instruct"
 DATA = "data/benchmark_results/turns.jsonl"
 OUTPUT_DIR = "./risk_grpo_output"
@@ -149,7 +149,7 @@ def reward_function(completions, phase, board_snapshot, outcome, **kwargs):
 def load_model(model_name=MODEL_GPU, max_seq_length=4096, cpu=False):
     """Load model for training.
 
-    GPU mode (default): Unsloth 4-bit quantization + QLoRA.
+    GPU mode (default): bitsandbytes 4-bit quantization + QLoRA.
     CPU mode (--cpu):   Plain transformers + PEFT LoRA with a smaller
                         model for debugging the full pipeline locally.
     """
@@ -159,23 +159,32 @@ def load_model(model_name=MODEL_GPU, max_seq_length=4096, cpu=False):
 
 
 def _load_model_gpu(model_name, max_seq_length):
-    """Load with Unsloth (requires GPU + CUDA)."""
-    from unsloth import FastLanguageModel
+    """Load with bitsandbytes 4-bit quantization + PEFT LoRA (requires GPU)."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from peft import LoraConfig, get_peft_model
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_name,
-        max_seq_length=max_seq_length,
+    bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
     )
-    model = FastLanguageModel.get_peft_model(
-        model,
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name, trust_remote_code=True
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, quantization_config=bnb_config, trust_remote_code=True
+    )
+    lora_config = LoraConfig(
         r=16,
         lora_alpha=16,
         target_modules=[
             "q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj",
         ],
+        task_type="CAUSAL_LM",
     )
+    model = get_peft_model(model, lora_config)
     return model, tokenizer
 
 
