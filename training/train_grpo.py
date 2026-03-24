@@ -284,6 +284,13 @@ def main():
     print()
 
     # Configure trainer (imports deferred — only needed on GPU)
+    # Mock vllm to prevent TRL's hard import error — we don't use vLLM
+    import types
+    if 'vllm' not in sys.modules:
+        _vllm = types.ModuleType('vllm')
+        _vllm.LLM = None
+        _vllm.SamplingParams = None
+        sys.modules['vllm'] = _vllm
     from trl import GRPOConfig, GRPOTrainer
 
     config_kwargs = dict(
@@ -296,7 +303,6 @@ def main():
         learning_rate=args.learning_rate,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
-        log_completions=True,
     )
     if args.cpu:
         config_kwargs.update(bf16=False, fp16=False, no_cuda=True)
