@@ -185,7 +185,10 @@ def _load_model_gpu(model_name, max_seq_length):
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_config)
-    model.gradient_checkpointing_enable()
+    model.enable_input_require_grads()
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
     return model, tokenizer
 
 
