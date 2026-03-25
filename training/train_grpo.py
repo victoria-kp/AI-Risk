@@ -252,6 +252,8 @@ def main():
                         help="Log every N steps (default: 5)")
     parser.add_argument("--save-steps", type=int, default=50,
                         help="Save checkpoint every N steps (default: 50)")
+    parser.add_argument("--temperature", type=float, default=0.9,
+                        help="Sampling temperature for generation (default: 0.9)")
     parser.add_argument("--cpu", action="store_true",
                         help="CPU debug mode: uses smaller model via "
                              "plain transformers + PEFT (no Unsloth)")
@@ -300,6 +302,7 @@ def main():
         learning_rate=args.learning_rate,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
+        temperature=args.temperature,
     )
     if args.cpu:
         config_kwargs.update(bf16=False, fp16=False, no_cuda=True)
