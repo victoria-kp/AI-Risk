@@ -123,6 +123,14 @@ def reward_function(completions, phase, board_snapshot, outcome, **kwargs):
     for completion, p, snap_json, out in zip(
         completions, phase, board_snapshot, outcome
     ):
+        # With chat-formatted prompts, TRL passes completions as message
+        # dicts (e.g. [{"role": "assistant", "content": "..."}]) instead
+        # of plain strings. Extract the text content.
+        if isinstance(completion, list):
+            completion = completion[-1]["content"] if completion else ""
+        elif isinstance(completion, dict):
+            completion = completion.get("content", "")
+
         snap = json.loads(snap_json)
         # Process any <tool_call> tags in the completion
         processed, tool_log = run_tool_loop(
