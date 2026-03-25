@@ -29,10 +29,12 @@ from typing import Dict, List, Optional
 
 # ── Weights ────────────────────────────────────────────────────────────
 
-W_QUALITY = 0.54
-W_TOOL_APPROPRIATENESS = 0.225
-W_EFFICIENCY = 0.135
+W_QUALITY = 0.35
+W_TOOL_APPROPRIATENESS = 0.15
+W_EFFICIENCY = 0.10
+W_PARTIAL = 0.30  # partial credit for attempts (creates reward variance)
 WIN_BONUS = 0.10
+# Base weights sum to 0.90, leaving room for WIN_BONUS
 
 
 # ── Preferred tools per phase ─────────────────────────────────────────
@@ -69,10 +71,12 @@ def compute_reward(completion: str, phase: str,
     quality = _score_format_and_quality(completion, phase, board_snapshot)
     tool_score = _score_tool_appropriateness(tool_log, phase)
     efficiency = _score_efficiency(tool_log)
+    partial = _score_partial_credit(completion, phase, board_snapshot)
 
     reward = (W_QUALITY * quality
               + W_TOOL_APPROPRIATENESS * tool_score
-              + W_EFFICIENCY * efficiency)
+              + W_EFFICIENCY * efficiency
+              + W_PARTIAL * partial)
 
     if outcome == "win":
         reward += WIN_BONUS
@@ -329,6 +333,59 @@ def _score_efficiency(tool_log: list) -> float:
         return 0.9
     else:
         return 0.5
+
+
+# ── Component 4: Partial Credit ────────────────────────────────────────
+
+def _score_partial_credit(completion: str, phase: str,
+                          snapshot: dict) -> float:
+    """Give fine-grained credit for partial attempts.
+
+    This creates reward variance among completions that would otherwise
+    all score 0 on the main components, enabling GRPO to learn.
+
+    Scores 0-1 based on:
+      +0.25  attempted tool call syntax (<tool_call> appears)
+      +0.15  closing tag present (</tool_call>)
+      +0.20  attempted JSON output (``` json or { found)
+      +0.20  mentions territory names from the board
+      +0.20  conciseness (shorter completions score higher)
+    """
+    score = 0.0
+    if not completion:
+        return 0.0
+
+    # Attempted tool call syntax
+    if "<tool_call>" in completion:
+        score += 0.50
+        if "</tool_call>" in completion:
+            score += 0.20
+
+    # Attempted JSON output
+    if "```json" in completion or '{"' + phase[:-1] in completion:
+        score += 0.20
+    elif "{" in completion and "}" in completion:
+        score += 0.10
+
+    # Mentions real territory names from the board
+    territories = set(snapshot.get("owned_territories", []))
+    if territories:
+        mentioned = sum(1 for t in territories if t in completion)
+        frac = min(1.0, mentioned / max(1, len(territories) // 3))
+        score += 0.20 * frac
+
+    # Conciseness: reward shorter completions (less rambling)
+    length = len(completion)
+    if length < 300:
+        score += 0.20
+    elif length < 600:
+        score += 0.15
+    elif length < 1000:
+        score += 0.10
+    else:
+        score += 0.05
+
+    return min(1.0, score)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
