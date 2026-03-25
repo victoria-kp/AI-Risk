@@ -15,8 +15,8 @@ import json
 from typing import Optional, Tuple, Dict, Any, List
 
 from tools.battle_sim import simulate_battle
-from tools.threat_analyzer import analyze_threats
-from tools.position_evaluator import evaluate_position
+from tools.threat_analyzer import analyze_threats, analyze_threats_from_snapshot
+from tools.position_evaluator import evaluate_position, evaluate_position_from_snapshot
 
 TOOL_CALL_PATTERN = re.compile(
     r'<tool_call>\s*(\w+)\s*\((.*?)\)\s*</tool_call>', re.DOTALL
@@ -91,7 +91,8 @@ def _parse_value(value: str) -> Any:
 
 
 def dispatch_tool(tool_name: str, kwargs: Dict[str, Any],
-                  game=None, player=None) -> str:
+                  game=None, player=None,
+                  board_snapshot=None) -> str:
     """Call a tool and return a formatted <tool_result> string.
 
     Args:
@@ -99,6 +100,8 @@ def dispatch_tool(tool_name: str, kwargs: Dict[str, Any],
         kwargs: parsed arguments from the model
         game: pyrisk Game object (injected, not from model)
         player: pyrisk Player object (injected, not from model)
+        board_snapshot: dict from turns.jsonl (used during training
+                        when game/player are unavailable)
 
     Returns:
         A <tool_result>...</tool_result> string to inject into context.
@@ -108,9 +111,20 @@ def dispatch_tool(tool_name: str, kwargs: Dict[str, Any],
                 f"Available tools: {', '.join(TOOL_REGISTRY.keys())}"
                 f"</tool_result>")
 
-    fn = TOOL_REGISTRY[tool_name]
     try:
-        result = fn(**kwargs, game=game, player=player)
+        # During training: use snapshot-based versions for tools that
+        # need game/player objects. battle_sim works either way.
+        if game is None and board_snapshot is not None:
+            if tool_name == "threat_analyzer":
+                result = analyze_threats_from_snapshot(board_snapshot)
+            elif tool_name == "position_evaluator":
+                result = evaluate_position_from_snapshot(board_snapshot)
+            else:
+                fn = TOOL_REGISTRY[tool_name]
+                result = fn(**kwargs, game=game, player=player)
+        else:
+            fn = TOOL_REGISTRY[tool_name]
+            result = fn(**kwargs, game=game, player=player)
         formatted = _format_result(result)
         return f"<tool_result>\n{formatted}\n</tool_result>"
     except Exception as e:
@@ -163,7 +177,8 @@ def _format_list(items: List) -> str:
 
 
 def run_tool_loop(text: str, game=None, player=None,
-                  max_calls: int = 3) -> Tuple[str, List[Dict]]:
+                  max_calls: int = 3,
+                  board_snapshot=None) -> Tuple[str, List[Dict]]:
     """Parse and execute all tool calls in the model's output.
 
     Processes tool calls sequentially (up to max_calls). For each
@@ -175,6 +190,8 @@ def run_tool_loop(text: str, game=None, player=None,
         game: pyrisk Game object
         player: pyrisk Player object
         max_calls: maximum number of tool calls to process
+        board_snapshot: dict from turns.jsonl (used during training
+                        when game/player are unavailable)
 
     Returns:
         (updated_text, tool_log) where:
@@ -193,7 +210,8 @@ def run_tool_loop(text: str, game=None, player=None,
 
         tool_name, kwargs = parsed
         result_str = dispatch_tool(tool_name, kwargs,
-                                   game=game, player=player)
+                                   game=game, player=player,
+                                   board_snapshot=board_snapshot)
         tool_log.append({
             "tool_name": tool_name,
             "kwargs": kwargs,

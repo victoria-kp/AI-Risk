@@ -57,3 +57,54 @@ def analyze_threats(game=None, player=None, **kwargs) -> List[Dict]:
 
     threats.sort(key=lambda x: x["threat_score"], reverse=True)
     return threats
+
+
+def analyze_threats_from_snapshot(snapshot: dict) -> List[Dict]:
+    """Snapshot-based version for use during training (no live game needed).
+
+    Uses board_snapshot dict with keys: player_name, owned_territories,
+    border_territories, territory_map.
+
+    Returns the same format as analyze_threats().
+    """
+    player_name = snapshot["player_name"]
+    borders = set(snapshot["border_territories"])
+    territory_map = snapshot["territory_map"]
+
+    threats = []
+    for t_name in snapshot["owned_territories"]:
+        if t_name not in borders:
+            continue
+
+        t_info = territory_map.get(t_name, {})
+        your_troops = t_info.get("forces", 0)
+
+        # Find enemy neighbors
+        enemies = []
+        for adj_name in t_info.get("adjacent", []):
+            adj_info = territory_map.get(adj_name, {})
+            if adj_info.get("owner") != player_name:
+                enemies.append((adj_name, adj_info))
+
+        if not enemies:
+            continue
+
+        enemy_troops = sum(info.get("forces", 0) for _, info in enemies)
+        most_dangerous_name, most_dangerous_info = max(
+            enemies, key=lambda x: x[1].get("forces", 0)
+        )
+        threat_score = (enemy_troops / your_troops
+                        if your_troops > 0 else float('inf'))
+
+        threats.append({
+            "territory": t_name,
+            "your_troops": your_troops,
+            "enemy_troops_adjacent": enemy_troops,
+            "threat_score": round(threat_score, 2),
+            "most_dangerous_neighbor": most_dangerous_name,
+            "most_dangerous_neighbor_troops": most_dangerous_info.get("forces", 0),
+            "most_dangerous_neighbor_owner": most_dangerous_info.get("owner", "?"),
+        })
+
+    threats.sort(key=lambda x: x["threat_score"], reverse=True)
+    return threats

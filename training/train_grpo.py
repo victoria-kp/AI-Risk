@@ -122,7 +122,8 @@ def reward_function(completions, phase, board_snapshot, outcome, **kwargs):
         snap = json.loads(snap_json)
         # Process any <tool_call> tags in the completion
         processed, tool_log = run_tool_loop(
-            completion, game=None, player=None
+            completion, game=None, player=None,
+            board_snapshot=snap
         )
         r = compute_reward(processed, p, snap, tool_log, outcome=out)
         rewards.append(r)
