@@ -248,8 +248,8 @@ def main():
                         help="Gradient accumulation steps (default: 4)")
     parser.add_argument("--max-completion-length", type=int, default=1024,
                         help="Max tokens per completion (default: 1024)")
-    parser.add_argument("--logging-steps", type=int, default=5,
-                        help="Log every N steps (default: 5)")
+    parser.add_argument("--logging-steps", type=int, default=1,
+                        help="Log every N steps (default: 1)")
     parser.add_argument("--save-steps", type=int, default=50,
                         help="Save checkpoint every N steps (default: 50)")
     parser.add_argument("--temperature", type=float, default=0.9,
