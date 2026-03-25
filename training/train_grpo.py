@@ -76,8 +76,12 @@ def load_dataset(path, max_examples=None):
             entry = json.loads(line)
             if entry["phase"] == "placement":
                 continue
+            # Format as chat messages so GRPOTrainer applies the model's
+            # chat template (e.g. Qwen's <|im_start|> tokens). Without this,
+            # raw prompt strings get tokenized directly and the model generates
+            # incoherent gibberish instead of following instructions.
             examples.append({
-                "prompt": entry["prompt"],
+                "prompt": [{"role": "user", "content": entry["prompt"]}],
                 "phase": entry["phase"],
                 "board_snapshot": json.dumps(entry["board_snapshot"]),
                 "outcome": entry["outcome"],
