@@ -62,13 +62,13 @@ OUTPUT_DIR = "./risk_grpo_output"
 
 # ── Dataset loading ───────────────────────────────────────────────────
 
-def load_dataset(path, tokenizer=None, max_examples=None):
+def load_dataset(path, max_examples=None):
     """Load turns.jsonl into a HuggingFace Dataset.
 
     Filters out placement phase (no tools involved).
     Serializes board_snapshot as JSON string for HF Dataset compatibility.
-    If tokenizer is provided, applies the chat template to prompts so the
-    model sees proper <|im_start|> tokens and generates coherent responses.
+    Prompts are formatted as chat message dicts so GRPOTrainer applies
+    the model's chat template automatically.
     """
     from datasets import Dataset as HFDataset
 
@@ -78,15 +78,8 @@ def load_dataset(path, tokenizer=None, max_examples=None):
             entry = json.loads(line)
             if entry["phase"] == "placement":
                 continue
-            prompt_text = entry["prompt"]
-            if tokenizer is not None:
-                prompt_text = tokenizer.apply_chat_template(
-                    [{"role": "user", "content": prompt_text}],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
             examples.append({
-                "prompt": prompt_text,
+                "prompt": [{"role": "user", "content": entry["prompt"]}],
                 "phase": entry["phase"],
                 "board_snapshot": json.dumps(entry["board_snapshot"]),
                 "outcome": entry["outcome"],
@@ -302,10 +295,9 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load dataset (pass tokenizer to apply chat template to prompts)
+    # Load dataset
     print("Loading dataset...")
-    dataset = load_dataset(args.data, tokenizer=tokenizer,
-                           max_examples=args.max_examples)
+    dataset = load_dataset(args.data, max_examples=args.max_examples)
     print(f"Dataset: {len(dataset)} examples "
           f"(phases: {set(dataset['phase'])})")
     print()
