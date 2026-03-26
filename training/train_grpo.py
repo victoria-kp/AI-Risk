@@ -196,6 +196,25 @@ def _load_model_gpu(model_name, max_seq_length):
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_config)
+    model.enable_input_require_grads()
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+
+    # Gradient checkpointing corrupts autoregressive generation in train
+    # mode, but we need it for the training forward pass (OOM without it).
+    # Wrap generate() to temporarily switch to eval mode.
+    _orig_generate = model.generate
+
+    def _safe_generate(*args, **kwargs):
+        model.eval()
+        try:
+            return _orig_generate(*args, **kwargs)
+        finally:
+            model.train()
+
+    model.generate = _safe_generate
+
     return model, tokenizer
 
 
