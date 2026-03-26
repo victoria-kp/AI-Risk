@@ -264,8 +264,10 @@ def main():
                         help="Per-device batch size (default: 1)")
     parser.add_argument("--grad-accum", type=int, default=4,
                         help="Gradient accumulation steps (default: 4)")
-    parser.add_argument("--max-completion-length", type=int, default=1024,
-                        help="Max tokens per completion (default: 1024)")
+    parser.add_argument("--max-completion-length", type=int, default=512,
+                        help="Max tokens per completion (default: 512)")
+    parser.add_argument("--max-prompt-length", type=int, default=3072,
+                        help="Max tokens per prompt (default: 3072)")
     parser.add_argument("--logging-steps", type=int, default=1,
                         help="Log every N steps (default: 1)")
     parser.add_argument("--save-steps", type=int, default=50,
@@ -314,6 +316,7 @@ def main():
     config_kwargs = dict(
         output_dir=args.output_dir,
         num_generations=args.num_generations,
+        max_prompt_length=args.max_prompt_length,
         max_completion_length=args.max_completion_length,
         max_steps=args.max_steps,
         per_device_train_batch_size=args.batch_size,
