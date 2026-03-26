@@ -188,6 +188,8 @@ def _score_attacks(completion: str, snapshot: dict) -> float:
             continue
         src = atk.get("src", "")
         target = atk.get("target", "")
+        if not isinstance(src, str) or not isinstance(target, str):
+            continue
         if src not in owned:
             continue
         src_info = territory_map.get(src, {})
@@ -254,6 +256,9 @@ def _score_movement(completion: str, snapshot: dict) -> float:
     src = movement.get("src", "")
     target = movement.get("target", "")
     count = movement.get("count", 0)
+
+    if not isinstance(src, str) or not isinstance(target, str):
+        return score
 
     try:
         count = int(count)
