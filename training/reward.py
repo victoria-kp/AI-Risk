@@ -1,20 +1,24 @@
 """Reward function for GRPO training.
 
-Scores model completions on three weighted components plus a win bonus:
+Scores model completions on four weighted components plus a win bonus:
 
-1. Format + Decision Quality (weight 0.54):
+1. Format + Decision Quality (weight 0.60):
    - Valid JSON output (+0.2), correct territory names (+0.2),
      sum constraints (+0.1), strategic quality heuristics (+0.5)
 
-2. Tool Use Appropriateness (weight 0.225):
+2. Tool Use Appropriateness (weight 0.15):
    - Did it call relevant tools for the task type?
    - threat_analyzer for reinforcement, battle_sim for attacks, etc.
 
-3. Efficiency (weight 0.135):
+3. Efficiency (weight 0.10):
    - 1-2 tool calls ideal for decisions
    - Penalize 0 calls (missed info) or 3+ (wasteful)
 
-4. Win bonus (+0.10):
+4. Partial Credit (weight 0.05):
+   - Minimal credit for attempted tool/JSON syntax.
+   - Prevents total-zero rewards for bad completions.
+
+5. Win bonus (+0.10):
    - Decisions from winning games receive a bonus.
    - Base components sum to 0.90 max, so the bonus always has room.
 
@@ -29,10 +33,18 @@ from typing import Dict, List, Optional
 
 # ── Weights ────────────────────────────────────────────────────────────
 
-W_QUALITY = 0.35
+# ── Round 1 weights (off-policy bootstrapping) ────────────────────────
+# W_QUALITY = 0.35
+# W_TOOL_APPROPRIATENESS = 0.15
+# W_EFFICIENCY = 0.10
+# W_PARTIAL = 0.30
+# WIN_BONUS = 0.10
+
+# ── Round 2 weights (strategic quality focus) ─────────────────────────
+W_QUALITY = 0.60
 W_TOOL_APPROPRIATENESS = 0.15
 W_EFFICIENCY = 0.10
-W_PARTIAL = 0.30  # partial credit for attempts (creates reward variance)
+W_PARTIAL = 0.05
 WIN_BONUS = 0.10
 # Base weights sum to 0.90, leaving room for WIN_BONUS
 
