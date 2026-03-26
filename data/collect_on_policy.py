@@ -1,16 +1,22 @@
-"""Benchmark Gemini LLMPlayer against pyrisk's built-in AIs.
+"""Collect on-policy training data by playing Risk with the trained model.
 
-Runs N games per matchup (LLM vs each AI), collecting:
-  1. Turn-level training data (turns.jsonl) — prompts, responses, decisions
-  2. Game-level KPI summary (summary.json) — win rates, call counts, etc.
+Plays N games per matchup using the PEFT-trained Qwen model, collecting
+turn-level data in the same format as data/benchmark_results/turns.jsonl.
 
-Supports resuming: if turns.jsonl already exists, skips completed games
-and appends new ones. summary.json is rebuilt from all data at the end.
+The data is saved to data/on_policy_results/ by default and includes a
+"data_source": "on_policy" field to distinguish it from off-policy data.
+
+Supports resuming: if turns.jsonl already exists, skips completed games.
 
 Usage:
-    python data/run_benchmark.py --games-per-matchup 1   # smoke test
-    python data/run_benchmark.py --games-per-matchup 20  # full benchmark
-    python data/run_benchmark.py --games-per-matchup 5 --output-dir data/my_run/
+    # On Colab (after training)
+    python data/collect_on_policy.py --model-path ./risk_grpo_output --games-per-matchup 5
+
+    # Smoke test (1 game)
+    python data/collect_on_policy.py --model-path ./risk_grpo_output --games-per-matchup 1
+
+    # Specific matchups only
+    python data/collect_on_policy.py --model-path ./risk_grpo_output --matchups vs_StupidAI vs_BetterAI
 """
 
 import argparse
@@ -35,18 +41,18 @@ from llm_player.benchmark_player import BenchmarkLLMPlayer
 
 # ── Matchup definitions ──────────────────────────────────────────────
 
-MATCHUPS = [
-    ("vs_StupidAI", StupidAI),
-    ("vs_BetterAI", BetterAI),
-    ("vs_AlAI", AlAI),
-    ("vs_ChronAI", ChronAI),
-]
+MATCHUPS = {
+    "vs_StupidAI": StupidAI,
+    "vs_BetterAI": BetterAI,
+    "vs_AlAI": AlAI,
+    "vs_ChronAI": ChronAI,
+}
 
 
 # ── Run one game ─────────────────────────────────────────────────────
 
 def run_game(opponent_class, seed=None):
-    """Run a single 3-player game: LLM + opponent + StupidAI.
+    """Run a single 3-player game: trained model + opponent + StupidAI.
 
     Returns (winner_name, game, llm_player, duration_s).
     """
@@ -68,11 +74,7 @@ def run_game(opponent_class, seed=None):
 # ── Resume support ───────────────────────────────────────────────────
 
 def _load_existing(turns_path):
-    """Load existing turns.jsonl and return (completed_games, all_game_records).
-
-    completed_games: dict of {matchup_name: set of game_ids}
-    all_game_records: list of per-game dicts reconstructed from turns data
-    """
+    """Load existing turns.jsonl and return (completed_games, all_game_records)."""
     completed_games = {}
     game_data = {}
 
@@ -110,12 +112,23 @@ def _load_existing(turns_path):
     return completed_games, list(game_data.values())
 
 
-# ── Main benchmark ───────────────────────────────────────────────────
+# ── Main collection ──────────────────────────────────────────────────
 
-def run_benchmark(games_per_matchup, output_dir):
+def collect(model_path, games_per_matchup, output_dir, matchup_names):
     os.makedirs(output_dir, exist_ok=True)
     turns_path = os.path.join(output_dir, "turns.jsonl")
     summary_path = os.path.join(output_dir, "summary.json")
+
+    # Set env var so ModelBackend auto-detects PEFT backend
+    os.environ["RISK_MODEL_PATH"] = os.path.abspath(model_path)
+
+    # Filter to requested matchups
+    matchups = [(name, MATCHUPS[name]) for name in matchup_names
+                if name in MATCHUPS]
+    if not matchups:
+        print(f"Error: no valid matchups in {matchup_names}")
+        print(f"Available: {list(MATCHUPS.keys())}")
+        return
 
     # Check for existing data to resume from
     completed_games, existing_game_records = _load_existing(turns_path)
@@ -128,17 +141,18 @@ def run_benchmark(games_per_matchup, output_dir):
     game_id = next_game_id
 
     total_existing = sum(len(ids) for ids in completed_games.values())
-    total_needed = len(MATCHUPS) * games_per_matchup
 
-    print(f"=== Benchmark: Gemini vs pyrisk AIs ===")
-    print(f"Model: gemini-2.5-flash-lite")
-    print(f"Games per matchup: {games_per_matchup}")
+    print(f"=== On-Policy Data Collection ===")
+    print(f"Model:        {model_path}")
+    print(f"Output:       {output_dir}")
+    print(f"Games/matchup: {games_per_matchup}")
+    print(f"Matchups:     {[m[0] for m in matchups]}")
     if total_existing > 0:
         print(f"Resuming: {total_existing} games already completed")
     print()
 
     with open(turns_path, "a") as turns_file:
-        for matchup_name, opponent_class in MATCHUPS:
+        for matchup_name, opponent_class in matchups:
             done = len(completed_games.get(matchup_name, set()))
             remaining = games_per_matchup - done
 
@@ -156,19 +170,23 @@ def run_benchmark(games_per_matchup, output_dir):
 
             for i in range(remaining):
                 seed = int(time.time() * 1000) % (2**31) + game_id
-                winner, game, llm_player, duration = run_game(
-                    opponent_class, seed=seed
-                )
+                try:
+                    winner, game, llm_player, duration = run_game(
+                        opponent_class, seed=seed
+                    )
+                except Exception as e:
+                    print(f"  Game {done + i + 1}: ERROR - {e}")
+                    game_id += 1
+                    continue
+
                 llm_won = (winner == "LLM")
                 if llm_won:
                     wins += 1
 
-                # Count fallbacks from turn log
                 fallback_count = sum(
                     1 for entry in llm_player.ai.turn_log if entry["fallback"]
                 )
 
-                # Game-level stats
                 game_record = {
                     "game_id": game_id,
                     "matchup": matchup_name,
@@ -183,7 +201,7 @@ def run_benchmark(games_per_matchup, output_dir):
                 matchup_games.append(game_record)
                 all_games.append(game_record)
 
-                # Write turn-level data (backfill outcome)
+                # Write turn-level data
                 outcome = "win" if llm_won else "loss"
                 for entry in llm_player.ai.turn_log:
                     turn_record = {
@@ -197,6 +215,7 @@ def run_benchmark(games_per_matchup, output_dir):
                         "fallback": entry["fallback"],
                         "board_snapshot": entry["board_snapshot"],
                         "outcome": outcome,
+                        "data_source": "on_policy",
                     }
                     turns_file.write(json.dumps(turn_record) + "\n")
                 turns_file.flush()
@@ -206,19 +225,18 @@ def run_benchmark(games_per_matchup, output_dir):
                 print(
                     f"  Game {game_num:>2}/{games_per_matchup}: {status:<14} "
                     f"({game.turn} turns, {llm_player.ai.model.call_count} calls, "
-                    f"{duration:.0f}s)"
+                    f"{fallback_count} fallbacks, {duration:.0f}s)"
                 )
                 game_id += 1
 
-            # Matchup summary (new games only for display)
             if matchup_games:
                 losses = remaining - wins
-                win_rate = wins / remaining
+                win_rate = wins / remaining if remaining > 0 else 0
                 print(f"  This run: LLM {wins}-{losses} ({win_rate:.1%} win rate)\n")
 
-    # Build summary from ALL data (existing + new)
+    # Build summary from ALL data
     all_matchup_stats = {}
-    for matchup_name, _ in MATCHUPS:
+    for matchup_name, _ in matchups:
         mg = [g for g in all_games if g["matchup"] == matchup_name]
         if not mg:
             continue
@@ -231,18 +249,17 @@ def run_benchmark(games_per_matchup, output_dir):
             "avg_turns": round(sum(g["total_turns"] for g in mg) / len(mg), 1),
             "avg_fallbacks": round(sum(g["fallback_count"] for g in mg) / len(mg), 1),
         }
-        # Only include api_calls/duration if available (not for resumed games)
-        if "api_calls" in mg[0]:
-            new_mg = [g for g in mg if "api_calls" in g]
-            if new_mg:
-                all_matchup_stats[matchup_name]["avg_api_calls"] = round(
-                    sum(g["api_calls"] for g in new_mg) / len(new_mg), 1)
-                all_matchup_stats[matchup_name]["avg_duration_s"] = round(
-                    sum(g["duration_s"] for g in new_mg) / len(new_mg), 1)
+        new_mg = [g for g in mg if "api_calls" in g]
+        if new_mg:
+            all_matchup_stats[matchup_name]["avg_api_calls"] = round(
+                sum(g["api_calls"] for g in new_mg) / len(new_mg), 1)
+            all_matchup_stats[matchup_name]["avg_duration_s"] = round(
+                sum(g["duration_s"] for g in new_mg) / len(new_mg), 1)
 
     summary = {
         "run_timestamp": datetime.now().isoformat(timespec="seconds"),
-        "model": "gemini-2.5-flash-lite",
+        "model": f"peft:{os.path.abspath(model_path)}",
+        "data_source": "on_policy",
         "games_per_matchup": games_per_matchup,
         "total_decisions": sum(1 for _ in open(turns_path)),
         "matchups": all_matchup_stats,
@@ -266,15 +283,28 @@ def run_benchmark(games_per_matchup, output_dir):
 # ── CLI ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Benchmark Gemini LLMPlayer vs pyrisk AIs")
-    parser.add_argument(
-        "--games-per-matchup", type=int, default=20,
-        help="Number of games per matchup (default: 20)",
+    parser = argparse.ArgumentParser(
+        description="Collect on-policy training data using the trained PEFT model"
     )
     parser.add_argument(
-        "--output-dir", type=str, default="data/benchmark_results",
-        help="Output directory for results (default: data/benchmark_results)",
+        "--model-path", type=str,
+        default=os.environ.get("RISK_MODEL_PATH", "risk_grpo_output"),
+        help="Path to PEFT adapter directory (default: risk_grpo_output)",
+    )
+    parser.add_argument(
+        "--games-per-matchup", type=int, default=5,
+        help="Number of games per matchup (default: 5)",
+    )
+    parser.add_argument(
+        "--output-dir", type=str, default="data/on_policy_results",
+        help="Output directory for results (default: data/on_policy_results)",
+    )
+    parser.add_argument(
+        "--matchups", type=str, nargs="+",
+        default=list(MATCHUPS.keys()),
+        help="Which matchups to run (default: all)",
     )
     args = parser.parse_args()
 
-    run_benchmark(args.games_per_matchup, args.output_dir)
+    collect(args.model_path, args.games_per_matchup,
+            args.output_dir, args.matchups)

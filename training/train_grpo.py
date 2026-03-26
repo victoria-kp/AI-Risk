@@ -62,28 +62,36 @@ OUTPUT_DIR = "./risk_grpo_output"
 
 # ── Dataset loading ───────────────────────────────────────────────────
 
-def load_dataset(path, max_examples=None):
-    """Load turns.jsonl into a HuggingFace Dataset.
+def load_dataset(paths, max_examples=None):
+    """Load one or more turns.jsonl files into a HuggingFace Dataset.
 
     Filters out placement phase (no tools involved).
     Serializes board_snapshot as JSON string for HF Dataset compatibility.
     Prompts are formatted as chat message dicts so GRPOTrainer applies
     the model's chat template automatically.
+
+    Args:
+        paths: single path string or list of path strings to turns.jsonl files.
+        max_examples: optional cap on total examples.
     """
     from datasets import Dataset as HFDataset
 
+    if isinstance(paths, str):
+        paths = [paths]
+
     examples = []
-    with open(path) as f:
-        for line in f:
-            entry = json.loads(line)
-            if entry["phase"] == "placement":
-                continue
-            examples.append({
-                "prompt": [{"role": "user", "content": entry["prompt"]}],
-                "phase": entry["phase"],
-                "board_snapshot": json.dumps(entry["board_snapshot"]),
-                "outcome": entry["outcome"],
-            })
+    for path in paths:
+        with open(path) as f:
+            for line in f:
+                entry = json.loads(line)
+                if entry["phase"] == "placement":
+                    continue
+                examples.append({
+                    "prompt": [{"role": "user", "content": entry["prompt"]}],
+                    "phase": entry["phase"],
+                    "board_snapshot": json.dumps(entry["board_snapshot"]),
+                    "outcome": entry["outcome"],
+                })
 
     if max_examples:
         examples = examples[:max_examples]
@@ -256,8 +264,9 @@ def main():
     )
     parser.add_argument("--model", type=str, default=None,
                         help="Model name or path (auto-selected if omitted)")
-    parser.add_argument("--data", type=str, default=DATA,
-                        help=f"Path to turns.jsonl (default: {DATA})")
+    parser.add_argument("--data", type=str, nargs="+", default=[DATA],
+                        help=f"Path(s) to turns.jsonl (default: {DATA}). "
+                             "Pass multiple paths to combine datasets.")
     parser.add_argument("--output-dir", type=str, default=OUTPUT_DIR,
                         help=f"Output directory (default: {OUTPUT_DIR})")
     parser.add_argument("--max-steps", type=int, default=200,
@@ -294,7 +303,7 @@ def main():
     mode = "CPU (debug)" if args.cpu else "GPU"
     print(f"=== GRPO Training for Risk [{mode}] ===")
     print(f"Model:        {args.model}")
-    print(f"Data:         {args.data}")
+    print(f"Data:         {', '.join(args.data)}")
     print(f"Output:       {args.output_dir}")
     print(f"Max steps:    {args.max_steps}")
     print(f"Generations:  {args.num_generations}")
