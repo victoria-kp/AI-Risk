@@ -165,23 +165,44 @@ def reward_function(completions, phase, board_snapshot, outcome, **kwargs):
 
 # ── Model loading ─────────────────────────────────────────────────────
 
-def load_model(model_name=MODEL_GPU, max_seq_length=4096, cpu=False):
+def load_model(model_name=MODEL_GPU, max_seq_length=4096, cpu=False,
+               resume_from=None):
     """Load model for training.
 
     GPU mode (default): bitsandbytes 4-bit quantization + QLoRA.
     CPU mode (--cpu):   Plain transformers + PEFT LoRA with a smaller
                         model for debugging the full pipeline locally.
+
+    Args:
+        resume_from: path to a PEFT adapter directory from a previous
+            training run. Loads the base model + existing LoRA weights
+            instead of creating a fresh LoRA. The model_name arg is
+            ignored when resume_from is set (base model is read from
+            the adapter config).
     """
     if cpu:
-        return _load_model_cpu(model_name, max_seq_length)
-    return _load_model_gpu(model_name, max_seq_length)
+        return _load_model_cpu(model_name, max_seq_length, resume_from)
+    return _load_model_gpu(model_name, max_seq_length, resume_from)
 
 
-def _load_model_gpu(model_name, max_seq_length):
-    """Load with bitsandbytes 4-bit quantization + PEFT LoRA (requires GPU)."""
+def _load_model_gpu(model_name, max_seq_length, resume_from=None):
+    """Load with bitsandbytes 4-bit quantization + PEFT LoRA (requires GPU).
+
+    If resume_from is set, loads the base model from the adapter config
+    and applies the existing LoRA weights instead of creating a fresh one.
+    """
+    import json as _json
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-    from peft import LoraConfig, get_peft_model
+    from peft import LoraConfig, get_peft_model, PeftModel
+
+    # If resuming, read the base model name from the adapter config
+    if resume_from:
+        config_path = os.path.join(resume_from, "adapter_config.json")
+        with open(config_path) as f:
+            adapter_cfg = _json.load(f)
+        model_name = adapter_cfg["base_model_name_or_path"]
+        print(f"Resuming from {resume_from} (base: {model_name})")
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -194,16 +215,23 @@ def _load_model_gpu(model_name, max_seq_length):
     model = AutoModelForCausalLM.from_pretrained(
         model_name, quantization_config=bnb_config, trust_remote_code=True
     )
-    lora_config = LoraConfig(
-        r=16,
-        lora_alpha=16,
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, lora_config)
+
+    if resume_from:
+        # Load existing LoRA weights from previous round
+        model = PeftModel.from_pretrained(model, resume_from, is_trainable=True)
+    else:
+        # Create fresh LoRA
+        lora_config = LoraConfig(
+            r=16,
+            lora_alpha=16,
+            target_modules=[
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ],
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_config)
+
     model.enable_input_require_grads()
     model.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -226,15 +254,23 @@ def _load_model_gpu(model_name, max_seq_length):
     return model, tokenizer
 
 
-def _load_model_cpu(model_name, max_seq_length):
+def _load_model_cpu(model_name, max_seq_length, resume_from=None):
     """Load with plain transformers + PEFT for CPU debugging.
 
     Uses a smaller model (Qwen 0.5B by default) in float32.
     Slow but catches: tokenization errors, tool call parsing bugs,
     reward function crashes, shape mismatches, NaN losses.
     """
+    import json as _json
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    from peft import LoraConfig, get_peft_model
+    from peft import LoraConfig, get_peft_model, PeftModel
+
+    if resume_from:
+        config_path = os.path.join(resume_from, "adapter_config.json")
+        with open(config_path) as f:
+            adapter_cfg = _json.load(f)
+        model_name = adapter_cfg["base_model_name_or_path"]
+        print(f"Resuming from {resume_from} (base: {model_name})")
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_name, trust_remote_code=True
@@ -243,16 +279,20 @@ def _load_model_cpu(model_name, max_seq_length):
         model_name, trust_remote_code=True
     )
 
-    lora_config = LoraConfig(
-        r=16,
-        lora_alpha=16,
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, lora_config)
+    if resume_from:
+        model = PeftModel.from_pretrained(model, resume_from, is_trainable=True)
+    else:
+        lora_config = LoraConfig(
+            r=16,
+            lora_alpha=16,
+            target_modules=[
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ],
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_config)
+
     return model, tokenizer
 
 
@@ -291,6 +331,9 @@ def main():
                         help="Save checkpoint every N steps (default: 50)")
     parser.add_argument("--temperature", type=float, default=0.9,
                         help="Sampling temperature for generation (default: 0.9)")
+    parser.add_argument("--resume-from", type=str, default=None,
+                        help="Path to PEFT adapter from previous round. "
+                             "Loads existing LoRA weights instead of fresh.")
     parser.add_argument("--cpu", action="store_true",
                         help="CPU debug mode: uses smaller model via "
                              "plain transformers + PEFT (no Unsloth)")
@@ -303,6 +346,8 @@ def main():
     mode = "CPU (debug)" if args.cpu else "GPU"
     print(f"=== GRPO Training for Risk [{mode}] ===")
     print(f"Model:        {args.model}")
+    if args.resume_from:
+        print(f"Resume from:  {args.resume_from}")
     print(f"Data:         {', '.join(args.data)}")
     print(f"Output:       {args.output_dir}")
     print(f"Max steps:    {args.max_steps}")
@@ -313,7 +358,8 @@ def main():
 
     # Load model
     print("Loading model...")
-    model, tokenizer = load_model(args.model, cpu=args.cpu)
+    model, tokenizer = load_model(args.model, cpu=args.cpu,
+                                  resume_from=args.resume_from)
 
     # Ensure pad token is set (required by GRPOTrainer)
     if tokenizer.pad_token is None:
