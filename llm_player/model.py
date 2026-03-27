@@ -52,6 +52,9 @@ class ModelBackend:
             qwen_path = model_path or os.environ.get("RISK_MODEL_PATH")
             if qwen_path and self._is_peft_adapter(qwen_path) and self._peft_available():
                 self._init_peft(qwen_path)
+            elif qwen_path and not self._is_peft_adapter(qwen_path) and self._transformers_available():
+                # Raw HuggingFace model name or local dir without adapter
+                self._init_transformers(qwen_path)
             elif qwen_path and self._vllm_available():
                 self._init_qwen(qwen_path)
             elif os.environ.get("GOOGLE_API_KEY") and self._genai_available():
@@ -59,7 +62,7 @@ class ModelBackend:
             else:
                 raise RuntimeError(
                     "No model backend available. Set RISK_MODEL_PATH "
-                    "(with vllm or peft installed) or GOOGLE_API_KEY "
+                    "(with vllm, peft, or transformers installed) or GOOGLE_API_KEY "
                     "(with google-genai installed)."
                 )
         elif backend == "peft":
@@ -67,6 +70,11 @@ class ModelBackend:
             if not path:
                 raise RuntimeError("RISK_MODEL_PATH not set and no model_path provided.")
             self._init_peft(path)
+        elif backend == "transformers":
+            path = model_path or os.environ.get("RISK_MODEL_PATH")
+            if not path:
+                raise RuntimeError("RISK_MODEL_PATH not set and no model_path provided.")
+            self._init_transformers(path)
         elif backend == "qwen":
             path = model_path or os.environ.get("RISK_MODEL_PATH")
             if not path:
@@ -75,7 +83,7 @@ class ModelBackend:
         elif backend == "gemini":
             self._init_gemini()
         else:
-            raise ValueError(f"Unknown backend: {backend!r}. Use 'auto', 'peft', 'qwen', or 'gemini'.")
+            raise ValueError(f"Unknown backend: {backend!r}. Use 'auto', 'peft', 'transformers', 'qwen', or 'gemini'.")
 
     @staticmethod
     def _vllm_available() -> bool:
@@ -97,6 +105,14 @@ class ModelBackend:
     def _peft_available() -> bool:
         try:
             import peft  # noqa: F401
+            import transformers  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    @staticmethod
+    def _transformers_available() -> bool:
+        try:
             import transformers  # noqa: F401
             return True
         except ImportError:
@@ -150,6 +166,31 @@ class ModelBackend:
 
         self.backend_type = "peft"
         LOG.info("PEFT backend ready (base: %s)", base_model_name)
+
+    def _init_transformers(self, model_name: str):
+        """Load a plain HuggingFace model via transformers (no LoRA adapter)."""
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        load_kwargs = {"trust_remote_code": True}
+        if torch.cuda.is_available():
+            from transformers import BitsAndBytesConfig
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.float16,
+            )
+
+        LOG.info("Loading model via transformers: %s", model_name)
+        self._model = AutoModelForCausalLM.from_pretrained(
+            model_name, **load_kwargs
+        )
+        self._model.eval()
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            model_name, trust_remote_code=True
+        )
+        self.backend_type = "peft"  # reuse _generate_peft (same logic)
+        LOG.info("Transformers backend ready: %s", model_name)
 
     def _init_qwen(self, model_path: str):
         from vllm import LLM
