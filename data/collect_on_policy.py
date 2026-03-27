@@ -119,8 +119,12 @@ def collect(model_path, games_per_matchup, output_dir, matchup_names):
     turns_path = os.path.join(output_dir, "turns.jsonl")
     summary_path = os.path.join(output_dir, "summary.json")
 
-    # Set env var so ModelBackend auto-detects PEFT backend
-    os.environ["RISK_MODEL_PATH"] = os.path.abspath(model_path)
+    # Set env var so ModelBackend auto-detects backend.
+    # Only convert to absolute path if it's a local directory (not a HF model name).
+    if os.path.exists(model_path):
+        os.environ["RISK_MODEL_PATH"] = os.path.abspath(model_path)
+    else:
+        os.environ["RISK_MODEL_PATH"] = model_path
 
     # Filter to requested matchups
     matchups = [(name, MATCHUPS[name]) for name in matchup_names
