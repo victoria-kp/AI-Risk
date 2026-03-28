@@ -180,8 +180,8 @@ class TestScoreAttacks(unittest.TestCase):
         """Empty attacks list when attacks are possible — passive but valid."""
         completion = '```json\n{"attacks": []}\n```'
         score = _score_attacks(completion, self.snap)
-        # 0.20 (json) + 0.30 (passive valid)
-        self.assertAlmostEqual(score, 0.50, places=2)
+        # 0.20 (json) + 0.05 (Round 3: penalize skipping when attacks available)
+        self.assertAlmostEqual(score, 0.25, places=2)
 
     def test_skip_attack_no_options(self):
         """Empty attacks when no attack options exist — correct decision."""
@@ -258,8 +258,8 @@ class TestScoreMovement(unittest.TestCase):
         """Null movement (skip) — reasonable default."""
         completion = '```json\n{"movement": null}\n```'
         score = _score_movement(completion, self.snap)
-        # 0.20 + 0.50
-        self.assertAlmostEqual(score, 0.70, places=2)
+        # 0.20 + 0.10 (Round 3: penalize skipping when useful moves exist)
+        self.assertAlmostEqual(score, 0.30, places=2)
 
     def test_border_to_inland(self):
         """Kamchatka (border) -> Japan (inland) — bad move."""

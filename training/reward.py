@@ -188,7 +188,8 @@ def _score_attacks(completion: str, snapshot: dict) -> float:
     if not attacks:
         has_options = _can_attack(owned, territory_map, player_name)
         if has_options:
-            score += 0.30  # valid but passive
+            # Round 2: score += 0.30  # valid but passive
+            score += 0.05  # Round 3: penalize skipping when attacks available
         else:
             score += 0.80  # correctly chose not to attack
         return score
@@ -257,9 +258,14 @@ def _score_movement(completion: str, snapshot: dict) -> float:
 
     movement = parsed.get("movement")
 
-    # null = skip movement — reasonable default
+    # null = skip movement
     if movement is None:
-        score += 0.50
+        # Round 2: score += 0.50  # always gave free points for skipping
+        # Round 3: penalize skipping when useful moves exist
+        if _can_move_useful(owned, borders, territory_map):
+            score += 0.10  # penalize: should be moving troops toward borders
+        else:
+            score += 0.40  # no useful moves — skipping is reasonable
         return score
 
     if not isinstance(movement, dict):
@@ -447,6 +453,20 @@ def _extract_json(text: str, key: str) -> Optional[dict]:
             pass
 
     return None
+
+
+def _can_move_useful(owned: set, borders: set, territory_map: dict) -> bool:
+    """Check if player has inland troops that could move toward a border."""
+    for name in owned:
+        if name in borders:
+            continue
+        info = territory_map.get(name, {})
+        if info.get("forces", 0) <= 1:
+            continue
+        for adj in info.get("adjacent", []):
+            if adj in borders and adj in owned:
+                return True
+    return False
 
 
 def _can_attack(owned: set, territory_map: dict, player_name: str) -> bool:
