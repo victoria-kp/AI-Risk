@@ -168,7 +168,6 @@ def main():
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         max_seq_length=args.max_seq_length,
-        dataset_text_field=None,  # using messages format
     )
     if args.cpu:
         config_kwargs.update(bf16=False, fp16=False, no_cuda=True)
