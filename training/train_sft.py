@@ -71,6 +71,8 @@ def load_dataset_sft(paths, max_examples=None, wins_only=False):
                     continue
                 if entry.get("fallback", False):
                     continue
+                if not entry.get("response"):
+                    continue
                 if wins_only and entry.get("outcome") != "win":
                     continue
                 examples.append({
