@@ -1,0 +1,14 @@
+{
+  "input": "data/benchmark_results/turns.jsonl",
+  "output": "data/sft_augmented/turns.jsonl",
+  "total_raw": 6592,
+  "filtered_out": 2552,
+  "clean_examples": 4040,
+  "augmented_with_tools": 2854,
+  "augment_ratio": 0.7,
+  "phase_counts": {
+    "reinforcements": 1402,
+    "attacks": 1275,
+    "movement": 1363
+  }
+}

@@ -47,9 +47,13 @@ def load_dataset_sft(paths, max_examples=None, wins_only=False):
     Formats each example as a chat conversation (user prompt + assistant
     response) so SFTTrainer applies the model's chat template.
 
-    Filters:
+    Filters (safety net — augment_sft_data.py does the main cleaning):
       - Skips placement phase (no tools involved)
       - Skips fallback entries (bad examples where parsing failed)
+      - Skips empty responses
+      - Skips <tool_call> without ```json (teaches failure pattern)
+      - Skips hallucinated <tool_result> in raw data (augmented data has real results)
+      - Skips degenerate long responses (>5000 chars before augmentation)
       - Optional: only winning game decisions (--wins-only)
 
     Args:
@@ -63,17 +67,33 @@ def load_dataset_sft(paths, max_examples=None, wins_only=False):
         paths = [paths]
 
     examples = []
+    skipped = 0
     for path in paths:
         with open(path) as f:
             for line in f:
                 entry = json.loads(line)
+                response = entry.get("response", "")
                 if entry["phase"] == "placement":
+                    skipped += 1
                     continue
                 if entry.get("fallback", False):
+                    skipped += 1
                     continue
-                if not entry.get("response"):
+                if not response:
+                    skipped += 1
                     continue
                 if wins_only and entry.get("outcome") != "win":
+                    skipped += 1
+                    continue
+                # Safety filters — catch bad examples that slipped through
+                # (augment_sft_data.py already handles these, but guard here too)
+                if "<tool_call>" in response and "```json" not in response:
+                    skipped += 1
+                    continue
+                if len(response) > 8000:
+                    # Higher threshold than augment script (5000) since
+                    # augmented responses include tool call prefix (~500 chars)
+                    skipped += 1
                     continue
                 examples.append({
                     "messages": [
@@ -81,6 +101,9 @@ def load_dataset_sft(paths, max_examples=None, wins_only=False):
                         {"role": "assistant", "content": entry["response"]},
                     ],
                 })
+
+    if skipped:
+        print(f"  Filtered {skipped} examples")
 
     if max_examples:
         examples = examples[:max_examples]
