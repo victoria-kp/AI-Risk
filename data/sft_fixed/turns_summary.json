@@ -1,0 +1,9 @@
+{
+  "total": 4040,
+  "attacks_fixed": 502,
+  "attacks_no_viable": 17,
+  "attacks_already_real": 756,
+  "movement_fixed": 48,
+  "movement_no_viable": 257,
+  "movement_already_real": 1058
+}
