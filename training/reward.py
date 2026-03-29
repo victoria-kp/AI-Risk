@@ -22,7 +22,8 @@ Scores model completions on four weighted components:
      components, enabling GRPO to learn from relative advantages.
 
 Evolution: Round 1 (off-policy bootstrap) → Round 2 (strategic quality
-focus) → Round 3 (anti-passivity) → Round 4 (smooth gradients for GRPO).
+focus) → Round 3 (anti-passivity) → Round 4 (smooth gradients for GRPO)
+→ Round 5 (penalize passivity: empty attacks and null movement).
 
 Handles three phase types: reinforcements, attacks, movement.
 Returns float reward in [0, 1].
@@ -218,7 +219,14 @@ def _score_attacks(completion: str, snapshot: dict) -> float:
         has_options = _can_attack(owned, territory_map, player_name)
         if has_options:
             # Round 2: score += 0.30  # valid but passive
-            score += 0.05  # Round 3: penalize skipping when attacks available
+            # Round 3: score += 0.05  # penalize skipping when attacks available
+            # Round 5: removed bonus entirely. Completions analysis showed 40%
+            # of attack outputs were empty {"attacks": []}, getting ~0.34 reward
+            # — too close to real attacks (~0.37). The model learned that
+            # "do nothing" is safe. Now empty attacks when options exist only
+            # get the 0.20 JSON credit, creating a clear gap vs real attacks.
+            # score += 0.05  # Round 3 value (commented out for Round 5)
+            return score
         else:
             score += 0.80  # correctly chose not to attack
         return score
@@ -291,8 +299,14 @@ def _score_movement(completion: str, snapshot: dict) -> float:
     if movement is None:
         # Round 2: score += 0.50  # always gave free points for skipping
         # Round 3: penalize skipping when useful moves exist
+        # Round 5: removed bonus when moves are available. Completions analysis
+        # showed {"movement": null} getting 0.54 reward — higher than real
+        # movements (0.34). The model learned that skipping is better than
+        # moving. Now null movement when moves exist only gets the 0.20 JSON
+        # credit, creating a clear gap vs actual troop repositioning.
         if _can_move_useful(owned, borders, territory_map):
-            score += 0.10  # penalize: should be moving troops toward borders
+            # score += 0.10  # Round 3 value (commented out for Round 5)
+            return score  # just 0.20 for valid JSON, no passivity bonus
         else:
             score += 0.40  # no useful moves — skipping is reasonable
         return score
