@@ -174,11 +174,17 @@ def main():
 
     config = SFTConfig(**config_kwargs)
 
+    def formatting_func(example):
+        return tokenizer.apply_chat_template(
+            example["messages"], tokenize=False
+        )
+
     trainer = SFTTrainer(
         model=model,
         args=config,
         train_dataset=dataset,
         processing_class=tokenizer,
+        formatting_func=formatting_func,
     )
 
     # Train
