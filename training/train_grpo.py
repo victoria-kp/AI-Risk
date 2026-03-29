@@ -54,7 +54,7 @@ from training.reward import compute_reward
 
 # ── Defaults ──────────────────────────────────────────────────────────
 
-MODEL_GPU = "Qwen/Qwen2.5-1.5B-Instruct"
+MODEL_GPU = "Qwen/Qwen2.5-7B-Instruct"
 MODEL_CPU = "Qwen/Qwen2.5-0.5B-Instruct"
 DATA = "data/benchmark_results/turns.jsonl"
 OUTPUT_DIR = "./risk_grpo_output"
