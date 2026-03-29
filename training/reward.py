@@ -1,10 +1,12 @@
 """Reward function for GRPO training.
 
-Scores model completions on four weighted components plus a win bonus:
+Scores model completions on four weighted components:
 
-1. Format + Decision Quality (weight 0.60):
+1. Format + Decision Quality (weight 0.65):
    - Valid JSON output (+0.2), correct territory names (+0.2),
      sum constraints (+0.1), strategic quality heuristics (+0.5)
+   - Round 4: smooth scoring — partial credit for partially correct
+     territory names instead of all-or-nothing cliffs.
 
 2. Tool Use Appropriateness (weight 0.15):
    - Did it call relevant tools for the task type?
@@ -14,13 +16,13 @@ Scores model completions on four weighted components plus a win bonus:
    - 1-2 tool calls ideal for decisions
    - Penalize 0 calls (missed info) or 3+ (wasteful)
 
-4. Partial Credit (weight 0.05):
-   - Minimal credit for attempted tool/JSON syntax.
-   - Prevents total-zero rewards for bad completions.
+4. Partial Credit (weight 0.10):
+   - Credit for attempted tool/JSON syntax.
+   - Creates reward variance among completions that fail on main
+     components, enabling GRPO to learn from relative advantages.
 
-5. Win bonus (+0.10):
-   - Decisions from winning games receive a bonus.
-   - Base components sum to 0.90 max, so the bonus always has room.
+Evolution: Round 1 (off-policy bootstrap) → Round 2 (strategic quality
+focus) → Round 3 (anti-passivity) → Round 4 (smooth gradients for GRPO).
 
 Handles three phase types: reinforcements, attacks, movement.
 Returns float reward in [0, 1].
@@ -41,12 +43,24 @@ from typing import Dict, List, Optional
 # WIN_BONUS = 0.10
 
 # ── Round 2 weights (strategic quality focus) ─────────────────────────
-W_QUALITY = 0.60
+# W_QUALITY = 0.60
+# W_TOOL_APPROPRIATENESS = 0.15
+# W_EFFICIENCY = 0.10
+# W_PARTIAL = 0.05
+# WIN_BONUS = 0.10
+# Base weights sum to 0.90, leaving room for WIN_BONUS
+
+# ── Round 4 weights (smooth gradients for GRPO) ──────────────────────
+# Changes from Round 2:
+# - Removed WIN_BONUS: all G completions share the same outcome for a
+#   given prompt, so the bonus cancels out in GRPO advantage computation.
+# - Increased W_QUALITY (0.60→0.65): quality is the main signal source.
+# - Increased W_PARTIAL (0.05→0.10): creates more reward variance among
+#   completions that fail on main components.
+W_QUALITY = 0.65
 W_TOOL_APPROPRIATENESS = 0.15
 W_EFFICIENCY = 0.10
-W_PARTIAL = 0.05
-WIN_BONUS = 0.10
-# Base weights sum to 0.90, leaving room for WIN_BONUS
+W_PARTIAL = 0.10
 
 
 # ── Preferred tools per phase ─────────────────────────────────────────
@@ -90,8 +104,11 @@ def compute_reward(completion: str, phase: str,
               + W_EFFICIENCY * efficiency
               + W_PARTIAL * partial)
 
-    if outcome == "win":
-        reward += WIN_BONUS
+    # Round 2: win bonus added +0.10 for winning games.
+    # Round 4: removed — all G completions for the same prompt share the
+    # same outcome, so the bonus cancels out in GRPO advantage computation.
+    # if outcome == "win":
+    #     reward += WIN_BONUS
 
     return max(0.0, min(1.0, reward))
 
@@ -143,7 +160,6 @@ def _score_reinforcements(completion: str, snapshot: dict) -> float:
     # Territory validity
     valid_count = sum(1 for name in reinf if name in owned)
     score += 0.20 * (valid_count / len(reinf))
-    all_owned = valid_count == len(reinf)
 
     # Sum check
     total = sum(reinf.values())
@@ -153,9 +169,22 @@ def _score_reinforcements(completion: str, snapshot: dict) -> float:
         score += 0.05
 
     # Strategic quality: troops on border territories
-    if all_owned and total > 0:
-        border_troops = sum(v for k, v in reinf.items() if k in borders)
-        score += 0.50 * (border_troops / total)
+    # Round 2 (cliff — required all_owned, one wrong name → 0 strategic score):
+    # if all_owned and total > 0:
+    #     border_troops = sum(v for k, v in reinf.items() if k in borders)
+    #     score += 0.50 * (border_troops / total)
+    #
+    # Round 4 (smooth — proportional credit for partially correct names):
+    # Gives gradient signal even with some wrong names, e.g. 4/5 valid names
+    # with good border placement → 0.50 * 0.80 * border_frac instead of 0.
+    if total > 0:
+        valid_reinf = {k: v for k, v in reinf.items() if k in owned}
+        if valid_reinf:
+            valid_total = sum(valid_reinf.values())
+            border_troops = sum(v for k, v in valid_reinf.items() if k in borders)
+            validity_frac = len(valid_reinf) / len(reinf)
+            border_frac = border_troops / valid_total if valid_total > 0 else 0
+            score += 0.50 * validity_frac * border_frac
 
     return score
 
@@ -284,16 +313,35 @@ def _score_movement(completion: str, snapshot: dict) -> float:
         return score
 
     # Validate ownership, adjacency, count
-    if src not in owned or target not in owned:
-        return score
+    # Round 2 (cliff — early return for any validation failure):
+    # if src not in owned or target not in owned:
+    #     return score
+    # ...
+    # if count <= 0 or count >= src_forces:
+    #     return score
+    # score += 0.20  # all valid
+    #
+    # Round 4 (smooth — partial credit for partially correct moves):
+    # Accumulates validity score across 4 checks instead of early-returning.
+    # Creates gradient between "almost valid" and "completely wrong."
+    validity = 0.0
+    total_checks = 4
+    if src in owned:
+        validity += 1
+    if target in owned:
+        validity += 1
     src_info = territory_map.get(src, {})
-    if target not in src_info.get("adjacent", []):
-        return score
+    if target in src_info.get("adjacent", []):
+        validity += 1
     src_forces = src_info.get("forces", 0)
-    if count <= 0 or count >= src_forces:
-        return score
+    if 0 < count < src_forces:
+        validity += 1
 
-    score += 0.20  # all valid
+    score += 0.20 * (validity / total_checks)
+
+    # Strategic quality only if fully valid (all 4 checks pass)
+    if validity < total_checks:
+        return score
 
     # Strategic quality: inland -> border is best
     src_is_border = src in borders
