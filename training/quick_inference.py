@@ -65,12 +65,16 @@ def main():
     prompts = load_prompts(args.data, args.num_prompts)
     print(f"Testing {len(prompts)} prompts ({args.temperature} temp, {args.max_tokens} max tokens)\n")
 
+    # Output directory
+    output_dir = "data/inference_checks"
+    os.makedirs(output_dir, exist_ok=True)
+
     # Track stats
     stats = {"tool_call": 0, "json_fence": 0, "total": 0}
+    results = []
 
     for i, entry in enumerate(prompts):
         phase = entry["phase"]
-        # Truncate prompt for display (first 100 chars)
         prompt_preview = entry["prompt"][:100].replace("\n", " ") + "..."
 
         print(f"{'='*60}")
@@ -85,11 +89,7 @@ def main():
             caller="inference_check",
         )
 
-        # Print completion (truncate if very long)
-        if len(completion) > 1000:
-            print(completion[:1000] + "\n... [truncated]")
-        else:
-            print(completion)
+        print(completion)
 
         # Track stats
         stats["total"] += 1
@@ -98,6 +98,14 @@ def main():
         if "```json" in completion:
             stats["json_fence"] += 1
 
+        results.append({
+            "phase": phase,
+            "prompt": entry["prompt"],
+            "completion": completion,
+            "has_tool_call": "<tool_call>" in completion,
+            "has_json_fence": "```json" in completion,
+        })
+
         print()
 
     # Summary
@@ -105,6 +113,14 @@ def main():
     print(f"SUMMARY ({stats['total']} completions)")
     print(f"  Tool calls:  {stats['tool_call']}/{stats['total']} ({stats['tool_call']/stats['total']*100:.0f}%)")
     print(f"  JSON fenced: {stats['json_fence']}/{stats['total']} ({stats['json_fence']/stats['total']*100:.0f}%)")
+
+    # Save full results
+    model_name = os.path.basename(args.model_path.rstrip("/"))
+    output_path = os.path.join(output_dir, f"{model_name}_inference.jsonl")
+    with open(output_path, "w") as f:
+        for r in results:
+            f.write(json.dumps(r) + "\n")
+    print(f"\nFull results saved to: {output_path}")
 
 
 if __name__ == "__main__":
