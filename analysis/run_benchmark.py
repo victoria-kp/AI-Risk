@@ -40,7 +40,13 @@ def main():
     parser.add_argument("--games", type=int, default=5)
     parser.add_argument("--output", type=str, default="results/benchmark")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--model", type=str, default=None,
+                        help="Model path (PEFT adapter or HF model name). "
+                             "Overrides RISK_MODEL_PATH env var.")
     args = parser.parse_args()
+
+    if args.model:
+        os.environ["RISK_MODEL_PATH"] = args.model
 
     os.makedirs(args.output, exist_ok=True)
     output_path = os.path.join(args.output, "turns.jsonl")
