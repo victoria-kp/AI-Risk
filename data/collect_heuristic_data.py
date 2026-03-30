@@ -1,15 +1,17 @@
 """Collect SFT training data from heuristic AI games.
 
-Runs BetterAI games and captures decisions with board snapshots.
+Runs BetterAI and ChronAI games and captures decisions with board snapshots.
 Generates synthetic LLM-style completions (tool call + strategic bridge + JSON)
 for SFT training.
 
-BetterAI has hard-coded continent strategy and wins much more often than
-Gemini Flash Lite (the original training data source, 30% win rate vs StupidAI).
-Training on these decisions teaches the model actual strategy:
+BetterAI has hard-coded continent strategy. ChronAI uses pathfinding and
+adaptive strategy (defensive when strong, aggressive when weak). Both win
+much more often than Gemini Flash Lite (the original training data source,
+30% win rate vs StupidAI). Training on these decisions teaches the model:
 - Prioritize a continent and focus there
 - Attack when you have force advantage
 - Move inland troops to borders
+- Adapt strategy based on board position
 
 The synthetic completion format matches what the LLM should output:
   <tool_call>tool_name(args)</tool_call>
@@ -23,7 +25,8 @@ Original game data is NOT modified. Output goes to a new file.
 
 Usage:
     python data/collect_heuristic_data.py
-    python data/collect_heuristic_data.py --games 50 --output data/heuristic_results/turns.jsonl
+    python data/collect_heuristic_data.py --games 200 --ai both
+    python data/collect_heuristic_data.py --games 100 --ai chron
 """
 
 import argparse
@@ -39,6 +42,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from game import Game
 from world import CONNECT, MAP, KEY, AREAS
 from ai.better import BetterAI
+from ai.chron import ChronAI
 from ai.stupid import StupidAI
 from risk_env.state_serializer import serialize_game_state
 from tools.battle_sim import simulate_battle
@@ -211,6 +215,99 @@ class LoggingBetterAI(BetterAI):
         result = super().reinforce(available)
 
         # Convert Territory objects to names
+        named = {}
+        for t, count in result.items():
+            name = t.name if hasattr(t, 'name') else str(t)
+            named[name] = named.get(name, 0) + count
+
+        self.turn_log.append({
+            "turn": self.game.turn,
+            "phase": "reinforcements",
+            "decision": named,
+            "board_snapshot": snapshot,
+            "board_summary": board_summary,
+            "available": available,
+        })
+
+        return result
+
+    def attack(self):
+        snapshot = self._snapshot()
+        board_summary = self._board_summary()
+
+        attacks_list = list(super().attack())
+
+        attack_decisions = []
+        for item in attacks_list:
+            src, target = item[0], item[1]
+            src_name = src.name if hasattr(src, 'name') else str(src)
+            tgt_name = target.name if hasattr(target, 'name') else str(target)
+            src_forces = snapshot["territory_map"].get(src_name, {}).get("forces", 0)
+            attack_decisions.append({
+                "src": src_name,
+                "target": tgt_name,
+                "count": max(1, src_forces - 1),
+            })
+
+        self.turn_log.append({
+            "turn": self.game.turn,
+            "phase": "attacks",
+            "decision": attack_decisions,
+            "board_snapshot": snapshot,
+            "board_summary": board_summary,
+        })
+
+        for attack in attacks_list:
+            yield attack
+
+    def freemove(self):
+        snapshot = self._snapshot()
+        board_summary = self._board_summary()
+
+        result = super().freemove()
+
+        if result:
+            src, target, count = result
+            movement = {
+                "src": src.name if hasattr(src, 'name') else str(src),
+                "target": target.name if hasattr(target, 'name') else str(target),
+                "count": count,
+            }
+        else:
+            movement = None
+
+        self.turn_log.append({
+            "turn": self.game.turn,
+            "phase": "movement",
+            "decision": movement,
+            "board_snapshot": snapshot,
+            "board_summary": board_summary,
+        })
+
+        return result
+
+
+class LoggingChronAI(ChronAI):
+    """ChronAI wrapper that logs decisions and board snapshots.
+
+    Reuses the same _snapshot and _board_summary methods as LoggingBetterAI.
+    """
+
+    def start(self):
+        super().start()
+        self.turn_log = []
+
+    # Reuse snapshot/summary from LoggingBetterAI
+    _snapshot = LoggingBetterAI._snapshot
+    _board_summary = LoggingBetterAI._board_summary
+
+    def reinforce(self, available):
+        snapshot = self._snapshot()
+        snapshot["reinforcements"] = available
+        board_summary = self._board_summary()
+
+        result = super().reinforce(available)
+
         named = {}
         for t, count in result.items():
             name = t.name if hasattr(t, 'name') else str(t)
@@ -568,13 +665,19 @@ def build_prompt(phase, board_summary, available=None):
 
 # ── Game running ─────────────────────────────────────────────────────
 
-def run_game(seed=None):
-    """Run one game: LoggingBetterAI vs StupidAI vs StupidAI."""
+AI_CLASSES = {
+    "better": LoggingBetterAI,
+    "chron": LoggingChronAI,
+}
+
+
+def run_game(ai_class, seed=None):
+    """Run one game: heuristic AI vs StupidAI vs StupidAI."""
     if seed is not None:
         random.seed(seed)
 
     game = Game(curses=False, connect=CONNECT, cmap=MAP, ckey=KEY, areas=AREAS)
-    game.add_player("LLM", LoggingBetterAI)
+    game.add_player("LLM", ai_class)
     game.add_player("OPP", StupidAI)
     game.add_player("FILL", StupidAI)
 
@@ -586,8 +689,15 @@ def run_game(seed=None):
 
 # ── Main ─────────────────────────────────────────────────────────────
 
-def collect(num_games, output_path, seed=42):
-    """Run games and convert decisions to SFT training data."""
+def collect(num_games, output_path, ai_names, seed=42):
+    """Run games and convert decisions to SFT training data.
+
+    Args:
+        num_games: games per AI type.
+        output_path: where to write turns.jsonl.
+        ai_names: list of AI names to use (e.g. ["better", "chron"]).
+        seed: random seed.
+    """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     all_entries = []
@@ -598,67 +708,71 @@ def collect(num_games, output_path, seed=42):
         "movement_null": 0, "tool_prefixes": 0,
     }
 
-    for i in range(num_games):
-        game_seed = seed + i
-        try:
-            winner, llm_player = run_game(seed=game_seed)
-        except Exception as e:
-            print(f"  Game {i+1}: ERROR - {e}")
-            continue
+    for ai_name in ai_names:
+        ai_class = AI_CLASSES[ai_name]
+        print(f"\n--- {ai_name.upper()} AI ({num_games} games) ---")
 
-        llm_won = (winner == "LLM")
-        outcome = "win" if llm_won else "loss"
-        stats["games"] += 1
-        if llm_won:
-            stats["wins"] += 1
+        for i in range(num_games):
+            game_seed = seed + i + (1000 if ai_name == "chron" else 0)
+            try:
+                winner, llm_player = run_game(ai_class, seed=game_seed)
+            except Exception as e:
+                print(f"  Game {i+1}: ERROR - {e}")
+                continue
 
-        status = "WIN" if llm_won else "LOSS"
-        n_decisions = len(llm_player.ai.turn_log)
-        print(f"  Game {i+1:>3}/{num_games}: {status:<4} "
-              f"({n_decisions} decisions)")
+            llm_won = (winner == "LLM")
+            outcome = "win" if llm_won else "loss"
+            stats["games"] += 1
+            if llm_won:
+                stats["wins"] += 1
 
-        # Convert each decision to a training entry
-        for entry in llm_player.ai.turn_log:
-            phase = entry["phase"]
-            decision = entry["decision"]
-            snapshot = entry["board_snapshot"]
-            board_summary = entry["board_summary"]
+            status = "WIN" if llm_won else "LOSS"
+            n_decisions = len(llm_player.ai.turn_log)
+            print(f"  Game {i+1:>3}/{num_games}: {status:<4} "
+                  f"({n_decisions} decisions)")
 
-            # Build prompt (same as LLM would see)
-            available = entry.get("available")
-            prompt = build_prompt(phase, board_summary, available)
+            # Convert each decision to a training entry
+            for entry in llm_player.ai.turn_log:
+                phase = entry["phase"]
+                decision = entry["decision"]
+                snapshot = entry["board_snapshot"]
+                board_summary = entry["board_summary"]
 
-            # Build synthetic completion
-            response = build_completion(phase, decision, snapshot)
+                # Build prompt (same as LLM would see)
+                available = entry.get("available")
+                prompt = build_prompt(phase, board_summary, available)
 
-            # Track stats
-            if phase == "reinforcements":
-                stats["reinforcements"] += 1
-            elif phase == "attacks":
-                stats["attacks"] += 1
-                if decision:
-                    stats["attacks_real"] += 1
-                else:
-                    stats["attacks_empty"] += 1
-            elif phase == "movement":
-                stats["movement"] += 1
-                if decision:
-                    stats["movement_real"] += 1
-                else:
-                    stats["movement_null"] += 1
+                # Build synthetic completion
+                response = build_completion(phase, decision, snapshot)
 
-            if "<tool_call>" in response:
-                stats["tool_prefixes"] += 1
+                # Track stats
+                if phase == "reinforcements":
+                    stats["reinforcements"] += 1
+                elif phase == "attacks":
+                    stats["attacks"] += 1
+                    if decision:
+                        stats["attacks_real"] += 1
+                    else:
+                        stats["attacks_empty"] += 1
+                elif phase == "movement":
+                    stats["movement"] += 1
+                    if decision:
+                        stats["movement_real"] += 1
+                    else:
+                        stats["movement_null"] += 1
 
-            all_entries.append({
-                "prompt": prompt,
-                "response": response,
-                "phase": phase,
-                "board_snapshot": snapshot,
-                "outcome": outcome,
-                "fallback": False,
-                "data_source": "heuristic_betterai",
-            })
+                if "<tool_call>" in response:
+                    stats["tool_prefixes"] += 1
+
+                all_entries.append({
+                    "prompt": prompt,
+                    "response": response,
+                    "phase": phase,
+                    "board_snapshot": snapshot,
+                    "outcome": outcome,
+                    "fallback": False,
+                    "data_source": f"heuristic_{ai_name}",
+                })
 
     # Write output
     with open(output_path, "w") as f:
@@ -691,12 +805,20 @@ if __name__ == "__main__":
         description="Collect SFT training data from heuristic AI games"
     )
     parser.add_argument("--games", type=int, default=50,
-                        help="Number of games to play (default: 50)")
+                        help="Number of games per AI type (default: 50)")
     parser.add_argument("--output", type=str,
                         default="data/heuristic_results/turns.jsonl",
                         help="Output path (default: data/heuristic_results/turns.jsonl)")
+    parser.add_argument("--ai", type=str, default="both",
+                        choices=["better", "chron", "both"],
+                        help="Which AI to use (default: both)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default: 42)")
     args = parser.parse_args()
 
-    collect(args.games, args.output, args.seed)
+    if args.ai == "both":
+        ai_names = ["better", "chron"]
+    else:
+        ai_names = [args.ai]
+
+    collect(args.games, args.output, ai_names, args.seed)
