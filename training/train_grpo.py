@@ -54,10 +54,11 @@ def load_dataset(paths, max_examples=None):
                 if phase not in ("reinforcements", "attacks"):
                     continue
 
+                snapshot = entry.get("board_snapshot") or entry.get("snapshot", {})
                 ex = {
                     "prompt": [{"role": "user", "content": entry["prompt"]}],
                     "phase": phase,
-                    "board_snapshot": json.dumps(entry["board_snapshot"]),
+                    "board_snapshot": json.dumps(snapshot),
                 }
                 if phase == "reinforcements":
                     ex["available"] = entry.get("available", 3)
