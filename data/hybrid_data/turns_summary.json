@@ -1,8 +1,8 @@
 {
-  "games": 2,
-  "wins": 2,
-  "reinforcements": 29,
-  "attacks": 29,
-  "attacks_real": 29,
-  "attacks_empty": 0
+  "games": 1000,
+  "wins": 771,
+  "reinforcements": 13824,
+  "attacks": 13824,
+  "attacks_real": 13705,
+  "attacks_empty": 119
 }
