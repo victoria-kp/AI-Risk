@@ -1,0 +1,12 @@
+{
+  "games": 200,
+  "wins": 151,
+  "reinforcements": 3068,
+  "attacks": 3068,
+  "attacks_real": 3034,
+  "attacks_empty": 34,
+  "movement": 3068,
+  "movement_real": 2867,
+  "movement_null": 201,
+  "tool_prefixes": 9204
+}
