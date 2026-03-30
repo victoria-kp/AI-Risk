@@ -1,8 +1,0 @@
-{
-  "input": "data/sft_augmented/turns.jsonl",
-  "output": "data/sft_trimmed/turns.jsonl",
-  "total_entries": 4040,
-  "trimmed_count": 3200,
-  "avg_len_before": 2522,
-  "avg_len_after": 1389
-}

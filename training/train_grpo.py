@@ -1,39 +1,13 @@
-"""GRPO training script for Qwen 2.5 3B.
+"""GRPO training script for Qwen on Risk game data.
 
-Run on Google Colab with T4 GPU, or locally on CPU for debugging.
-
-Training data: data/benchmark_results/turns.jsonl
-Each line has {prompt, phase, board_snapshot, outcome}.
-
-For each prompt, GRPO generates G completions (default 4).
-Each completion is:
-  1. Processed by run_tool_loop() for <tool_call> tags
-  2. Scored by reward.compute_reward() using board_snapshot
-No ground truth needed — GRPO uses relative advantages
-between the G completions to update the policy.
-
-The model learns both tool-calling (when to use
-battle_sim, threat_analyzer, position_evaluator)
-and decision-making (reinforcements, attacks, movement).
-
-Note on tool execution during training:
-  - battle_sim works fully (only needs attacking/defending counts)
-  - threat_analyzer and position_evaluator return errors (need game/player
-    objects not available during training). The model still gets credit
-    for calling the right tool — it just won't see real results. During
-    actual gameplay via LangGraph, all tools work with real game state.
+Scores reinforce + attack completions using reward_hybrid.
+Shorter completions (256 tokens). No tool calling.
 
 Usage:
-    # CPU debug (local, catch bugs before using GPU hours)
-    # Uses Qwen 0.5B via plain transformers + PEFT — slow but finds bugs
+    python training/train_grpo.py --resume-from ./risk_sft_output --max-steps 30
+
+    # CPU debug
     python training/train_grpo.py --cpu --max-steps 2 --num-generations 2 --max-examples 10
-
-    # GPU training (Colab T4)
-    # Uses Qwen 2.5 3B 4-bit via bitsandbytes + QLoRA
-    python training/train_grpo.py --max-steps 200
-
-    # Full training run
-    python training/train_grpo.py --max-steps 200 --save-steps 50
 """
 
 import argparse
@@ -44,35 +18,27 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'pyrisk_vendor'))
 
-from risk_env.tool_interface import run_tool_loop
-from training.reward import compute_reward
+from training.reward_hybrid import compute_reward as compute_reward_hybrid
 
 # GPU-only imports (trl, datasets, bitsandbytes) are deferred to the
-# functions that need them so that load_dataset() and reward_function()
-# remain importable on CPU-only machines (used by analysis/evaluate.py).
+# functions that need them so that load_model() remains importable
+# on CPU-only machines (used by train_sft.py).
 
 
 # ── Defaults ──────────────────────────────────────────────────────────
 
 MODEL_GPU = "Qwen/Qwen2.5-7B-Instruct"
 MODEL_CPU = "Qwen/Qwen2.5-0.5B-Instruct"
-DATA = "data/benchmark_results/turns.jsonl"
+DATA = "data/hybrid_data/turns.jsonl"
 OUTPUT_DIR = "./risk_grpo_output"
 
 
 # ── Dataset loading ───────────────────────────────────────────────────
 
 def load_dataset(paths, max_examples=None):
-    """Load one or more turns.jsonl files into a HuggingFace Dataset.
+    """Load hybrid turns.jsonl (reinforce + attack only).
 
-    Filters out placement phase (no tools involved).
-    Serializes board_snapshot as JSON string for HF Dataset compatibility.
-    Prompts are formatted as chat message dicts so GRPOTrainer applies
-    the model's chat template automatically.
-
-    Args:
-        paths: single path string or list of path strings to turns.jsonl files.
-        max_examples: optional cap on total examples.
+    Includes attack_menu as JSON string for attack reward computation.
     """
     from datasets import Dataset as HFDataset
 
@@ -84,14 +50,24 @@ def load_dataset(paths, max_examples=None):
         with open(path) as f:
             for line in f:
                 entry = json.loads(line)
-                if entry["phase"] == "placement":
+                phase = entry["phase"]
+                if phase not in ("reinforcements", "attacks"):
                     continue
-                examples.append({
+
+                ex = {
                     "prompt": [{"role": "user", "content": entry["prompt"]}],
-                    "phase": entry["phase"],
+                    "phase": phase,
                     "board_snapshot": json.dumps(entry["board_snapshot"]),
-                    "outcome": entry["outcome"],
-                })
+                }
+                if phase == "reinforcements":
+                    ex["available"] = entry.get("available", 3)
+                    ex["attack_menu"] = "[]"
+                elif phase == "attacks":
+                    ex["available"] = 0
+                    ex["attack_menu"] = json.dumps(
+                        entry.get("attack_menu", []))
+
+                examples.append(ex)
 
     if max_examples:
         examples = examples[:max_examples]
@@ -101,60 +77,47 @@ def load_dataset(paths, max_examples=None):
 
 # ── Reward function ───────────────────────────────────────────────────
 
-# Global log file handle, set by main() before training starts.
 _completions_log_file = None
 _completions_step = 0
 
 
-def reward_function(completions, phase, board_snapshot, outcome, **kwargs):
-    """GRPO reward: process tool calls, then score each completion.
-
-    Called by GRPOTrainer for each batch of generated completions.
-    Extra dataset columns (phase, board_snapshot, outcome) are passed
-    automatically as keyword arguments.
+def reward_function(completions, phase, board_snapshot,
+                    available, attack_menu, **kwargs):
+    """GRPO reward: score JSON output for reinforce/attack completions.
 
     Args:
-        completions: list of model-generated text strings.
-        phase: list of phase strings per completion.
-        board_snapshot: list of JSON-encoded board state strings.
-        outcome: list of "win"/"loss" strings.
-
-    Returns:
-        List of float rewards in [0, 1].
+        completions: list of generated texts.
+        phase: list of phase strings.
+        board_snapshot: list of JSON board state strings.
+        available: list of int (troops to place, 0 for attacks).
+        attack_menu: list of JSON attack menu strings.
     """
     global _completions_step
     _completions_step += 1
 
     rewards = []
-    for completion, p, snap_json, out in zip(
-        completions, phase, board_snapshot, outcome
+    for completion, p, snap_json, avail, menu_json in zip(
+        completions, phase, board_snapshot, available, attack_menu
     ):
-        # With chat-formatted prompts, TRL passes completions as message
-        # dicts (e.g. [{"role": "assistant", "content": "..."}]) instead
-        # of plain strings. Extract the text content.
         if isinstance(completion, list):
             completion = completion[-1]["content"] if completion else ""
         elif isinstance(completion, dict):
             completion = completion.get("content", "")
 
         snap = json.loads(snap_json)
-        # Process any <tool_call> tags in the completion
-        processed, tool_log = run_tool_loop(
-            completion, game=None, player=None,
-            board_snapshot=snap
+        menu = json.loads(menu_json)
+
+        r = compute_reward_hybrid(
+            completion, p, snap,
+            available=avail, attack_menu=menu,
         )
-        r = compute_reward(processed, p, snap, tool_log, outcome=out)
         rewards.append(r)
 
-        # Log completion to file
         if _completions_log_file is not None:
-            tools_called = [t["tool_name"] for t in tool_log]
             record = {
                 "step": _completions_step,
                 "phase": p,
-                "outcome": out,
                 "reward": round(r, 4),
-                "tools_called": tools_called,
                 "completion": completion[:2000],
             }
             _completions_log_file.write(json.dumps(record) + "\n")
@@ -186,17 +149,12 @@ def load_model(model_name=MODEL_GPU, max_seq_length=4096, cpu=False,
 
 
 def _load_model_gpu(model_name, max_seq_length, resume_from=None):
-    """Load with bitsandbytes 4-bit quantization + PEFT LoRA (requires GPU).
-
-    If resume_from is set, loads the base model from the adapter config
-    and applies the existing LoRA weights instead of creating a fresh one.
-    """
+    """Load with bitsandbytes 4-bit quantization + PEFT LoRA (requires GPU)."""
     import json as _json
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
     from peft import LoraConfig, get_peft_model, PeftModel
 
-    # If resuming, read the base model name from the adapter config
     if resume_from:
         config_path = os.path.join(resume_from, "adapter_config.json")
         with open(config_path) as f:
@@ -217,10 +175,8 @@ def _load_model_gpu(model_name, max_seq_length, resume_from=None):
     )
 
     if resume_from:
-        # Load existing LoRA weights from previous round
         model = PeftModel.from_pretrained(model, resume_from, is_trainable=True)
     else:
-        # Create fresh LoRA
         lora_config = LoraConfig(
             r=16,
             lora_alpha=16,
@@ -258,8 +214,8 @@ def _load_model_cpu(model_name, max_seq_length, resume_from=None):
     """Load with plain transformers + PEFT for CPU debugging.
 
     Uses a smaller model (Qwen 0.5B by default) in float32.
-    Slow but catches: tokenization errors, tool call parsing bugs,
-    reward function crashes, shape mismatches, NaN losses.
+    Slow but catches: tokenization errors, reward function crashes,
+    shape mismatches, NaN losses.
     """
     import json as _json
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -300,13 +256,12 @@ def _load_model_cpu(model_name, max_seq_length, resume_from=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="GRPO training for Risk strategy with tool-use"
+        description="GRPO training for Risk strategy"
     )
     parser.add_argument("--model", type=str, default=None,
                         help="Model name or path (auto-selected if omitted)")
     parser.add_argument("--data", type=str, nargs="+", default=[DATA],
-                        help=f"Path(s) to turns.jsonl (default: {DATA}). "
-                             "Pass multiple paths to combine datasets.")
+                        help=f"Path(s) to turns.jsonl (default: {DATA})")
     parser.add_argument("--output-dir", type=str, default=OUTPUT_DIR,
                         help=f"Output directory (default: {OUTPUT_DIR})")
     parser.add_argument("--max-steps", type=int, default=200,
@@ -321,8 +276,8 @@ def main():
                         help="Per-device batch size (default: 1)")
     parser.add_argument("--grad-accum", type=int, default=4,
                         help="Gradient accumulation steps (default: 4)")
-    parser.add_argument("--max-completion-length", type=int, default=512,
-                        help="Max tokens per completion (default: 512)")
+    parser.add_argument("--max-completion-length", type=int, default=256,
+                        help="Max tokens per completion (default: 256)")
     parser.add_argument("--max-prompt-length", type=int, default=3072,
                         help="Max tokens per prompt (default: 3072)")
     parser.add_argument("--logging-steps", type=int, default=1,
@@ -332,19 +287,16 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.9,
                         help="Sampling temperature for generation (default: 0.9)")
     parser.add_argument("--resume-from", type=str, default=None,
-                        help="Path to PEFT adapter from previous round. "
-                             "Loads existing LoRA weights instead of fresh.")
+                        help="Path to PEFT adapter from previous round.")
     parser.add_argument("--cpu", action="store_true",
-                        help="CPU debug mode: uses smaller model via "
-                             "plain transformers + PEFT (no Unsloth)")
+                        help="CPU debug mode: smaller model, no quantization")
     args = parser.parse_args()
 
-    # Pick default model based on mode
     if args.model is None:
         args.model = MODEL_CPU if args.cpu else MODEL_GPU
 
-    mode = "CPU (debug)" if args.cpu else "GPU"
-    print(f"=== GRPO Training for Risk [{mode}] ===")
+    hw_str = "CPU (debug)" if args.cpu else "GPU"
+    print(f"=== GRPO Training for Risk [{hw_str}] ===")
     print(f"Model:        {args.model}")
     if args.resume_from:
         print(f"Resume from:  {args.resume_from}")
@@ -352,6 +304,7 @@ def main():
     print(f"Output:       {args.output_dir}")
     print(f"Max steps:    {args.max_steps}")
     print(f"Generations:  {args.num_generations}")
+    print(f"LR:           {args.learning_rate}")
     if args.max_examples:
         print(f"Max examples: {args.max_examples}")
     print()
@@ -361,7 +314,6 @@ def main():
     model, tokenizer = load_model(args.model, cpu=args.cpu,
                                   resume_from=args.resume_from)
 
-    # Ensure pad token is set (required by GRPOTrainer)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -372,7 +324,7 @@ def main():
           f"(phases: {set(dataset['phase'])})")
     print()
 
-    # Configure trainer (imports deferred — only needed on GPU)
+    # Configure trainer
     from trl import GRPOConfig, GRPOTrainer
 
     config_kwargs = dict(

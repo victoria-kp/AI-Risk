@@ -1,25 +1,14 @@
 """SFT (Supervised Fine-Tuning) script for Qwen on Risk game data.
 
-Teaches the model the correct output format (valid JSON, tool call syntax,
-territory names) by training on Gemini game data. This is the first stage
-of a two-stage pipeline:
-
-  1. SFT  — learn the format (this script)
-  2. GRPO — improve strategy (train_grpo.py --resume-from <sft_output>)
-
-Training data: data/benchmark_results/turns.jsonl
-Each line has {prompt, response, phase, outcome, fallback}.
-The model learns to produce the response given the prompt.
+Trains on reinforce + attack data with menu-based prompts.
+Data from collect_heuristic_data.py.
 
 Usage:
-    # GPU training (Colab)
     python training/train_sft.py --max-steps 100
+    python training/train_grpo.py --resume-from ./risk_sft_output --max-steps 30
 
-    # CPU debug (local)
+    # CPU debug
     python training/train_sft.py --cpu --max-steps 2 --max-examples 10
-
-    # Then run GRPO on top
-    python training/train_grpo.py --resume-from ./risk_sft_output --max-steps 200
 """
 
 import argparse
@@ -35,7 +24,7 @@ from training.train_grpo import load_model, MODEL_GPU, MODEL_CPU
 
 # ── Defaults ──────────────────────────────────────────────────────────
 
-DATA = "data/benchmark_results/turns.jsonl"
+DATA = "data/hybrid_data/turns.jsonl"
 OUTPUT_DIR = "./risk_sft_output"
 
 
@@ -46,15 +35,6 @@ def load_dataset_sft(paths, max_examples=None, wins_only=False):
 
     Formats each example as a chat conversation (user prompt + assistant
     response) so SFTTrainer applies the model's chat template.
-
-    Filters (safety net — augment_sft_data.py does the main cleaning):
-      - Skips placement phase (no tools involved)
-      - Skips fallback entries (bad examples where parsing failed)
-      - Skips empty responses
-      - Skips <tool_call> without ```json (teaches failure pattern)
-      - Skips hallucinated <tool_result> in raw data (augmented data has real results)
-      - Skips degenerate long responses (>5000 chars before augmentation)
-      - Optional: only winning game decisions (--wins-only)
 
     Args:
         paths: single path or list of paths to turns.jsonl files.
@@ -73,10 +53,9 @@ def load_dataset_sft(paths, max_examples=None, wins_only=False):
             for line in f:
                 entry = json.loads(line)
                 response = entry.get("response", "")
-                if entry["phase"] == "placement":
-                    skipped += 1
-                    continue
-                if entry.get("fallback", False):
+                phase = entry.get("phase", "")
+
+                if phase not in ("reinforcements", "attacks"):
                     skipped += 1
                     continue
                 if not response:
@@ -85,16 +64,7 @@ def load_dataset_sft(paths, max_examples=None, wins_only=False):
                 if wins_only and entry.get("outcome") != "win":
                     skipped += 1
                     continue
-                # Safety filters — catch bad examples that slipped through
-                # (augment_sft_data.py already handles these, but guard here too)
-                if "<tool_call>" in response and "```json" not in response:
-                    skipped += 1
-                    continue
-                if len(response) > 8000:
-                    # Higher threshold than augment script (5000) since
-                    # augmented responses include tool call prefix (~500 chars)
-                    skipped += 1
-                    continue
+
                 examples.append({
                     "messages": [
                         {"role": "user", "content": entry["prompt"]},
@@ -147,12 +117,11 @@ def main():
                         help="CPU debug mode (smaller model, no quantization)")
     args = parser.parse_args()
 
-    # Pick default model based on mode
     if args.model is None:
         args.model = MODEL_CPU if args.cpu else MODEL_GPU
 
-    mode = "CPU (debug)" if args.cpu else "GPU"
-    print(f"=== SFT Training for Risk [{mode}] ===")
+    hw_str = "CPU (debug)" if args.cpu else "GPU"
+    print(f"=== SFT Training for Risk [{hw_str}] ===")
     print(f"Model:        {args.model}")
     if args.resume_from:
         print(f"Resume from:  {args.resume_from}")
@@ -222,7 +191,8 @@ def main():
     tokenizer.save_pretrained(args.output_dir)
     print("Done!")
     print(f"\nNext step: GRPO training on top of SFT")
-    print(f"  python training/train_grpo.py --resume-from {args.output_dir} --max-steps 200")
+    print(f"  python training/train_grpo.py "
+          f"--resume-from {args.output_dir} --max-steps 30")
 
 
 if __name__ == "__main__":

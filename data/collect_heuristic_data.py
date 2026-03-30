@@ -1,36 +1,14 @@
 """Collect SFT training data from heuristic AI games.
 
-Runs BetterAI and ChronAI games and captures decisions with board snapshots.
-Generates synthetic LLM-style completions (tool call + strategic bridge + JSON)
-for SFT training.
-
-BetterAI has hard-coded continent strategy. ChronAI uses pathfinding and
-adaptive strategy (defensive when strong, aggressive when weak). Both win
-much more often than Gemini Flash Lite (the original training data source,
-30% win rate vs StupidAI). Training on these decisions teaches the model:
-- Prioritize a continent and focus there
-- Attack when you have force advantage
-- Move inland troops to borders
-- Adapt strategy based on board position
-
-The synthetic completion format matches what the LLM should output:
-  <tool_call>tool_name(args)</tool_call>
-  <tool_result>...</tool_result>
-  Strategic reasoning (2-3 sentences referencing tool results).
-  ```json
-  {"decision": ...}
-  ```
-
-Original game data is NOT modified. Output goes to a new file.
+Runs BetterAI, AlAI, and ChronAI games and captures reinforce + attack
+decisions with board snapshots. Uses menu-based prompts (no tool calls).
 
 Usage:
-    python data/collect_heuristic_data.py
-    python data/collect_heuristic_data.py --games 200 --ai both
-    python data/collect_heuristic_data.py --games 100 --ai chron
+    python data/collect_heuristic_data.py --games 200 --ai all
+    python data/collect_heuristic_data.py --games 200 --ai better
 """
 
 import argparse
-import collections
 import json
 import os
 import random
@@ -44,94 +22,12 @@ from world import CONNECT, MAP, KEY, AREAS
 from ai.better import BetterAI
 from ai.chron import ChronAI
 from ai.stupid import StupidAI
-from risk_env.state_serializer import serialize_game_state
-from tools.battle_sim import simulate_battle
-from tools.threat_analyzer import analyze_threats_from_snapshot
-from tools.position_evaluator import evaluate_position_from_snapshot
-from risk_env.tool_interface import _format_result
-
-
-# ── Prompt templates (exact copies from llm_player/nodes/) ────────────
-
-REINFORCEMENT_PROMPT = """You are playing Risk. Here is the current board state:
-
-{board_summary}
-
-You have {available} reinforcement troops to place on your territories.
-
-You may optionally call tools before deciding. Available tools:
-- battle_sim(attacking=N, defending=N) — simulate battle odds
-- threat_analyzer() — analyze threats to your territories
-- position_evaluator() — evaluate your overall board position
-
-To call a tool, write: <tool_call>tool_name(args)</tool_call>
-
-After any tool analysis, output your final decision as JSON:
-```json
-{{"reinforcements": {{"TerritoryName": count, ...}}}}
-```
-
-Rules:
-- Troop counts must sum to exactly {available}
-- You can only place troops on territories you own
-- Place troops strategically: prioritize border territories under threat"""
-
-ATTACK_PROMPT = """You are playing Risk. Here is the current board state:
-
-{board_summary}
-
-Decide which attacks to execute this turn. You may attack 0 or more times.
-
-You may optionally call tools before deciding. Available tools:
-- battle_sim(attacking=N, defending=N) — simulate battle odds
-- threat_analyzer() — analyze threats to your territories
-- position_evaluator() — evaluate your overall board position
-
-To call a tool, write: <tool_call>tool_name(args)</tool_call>
-
-After any tool analysis, output your final decision as JSON:
-```json
-{{"attacks": [{{"src": "YourTerritory", "target": "EnemyTerritory"}}, ...]}}
-```
-
-Or to skip attacking:
-```json
-{{"attacks": []}}
-```
-
-Rules:
-- src must be a territory you own with more than 1 troop
-- target must be adjacent to src and owned by an enemy
-- You can list multiple attacks; they execute in order"""
-
-MOVEMENT_PROMPT = """You are playing Risk. Here is the current board state:
-
-{board_summary}
-
-You may make one free troop movement: move troops from one of your territories
-to another connected friendly territory.
-
-You may optionally call tools before deciding. Available tools:
-- battle_sim(attacking=N, defending=N) — simulate battle odds
-- threat_analyzer() — analyze threats to your territories
-- position_evaluator() — evaluate your overall board position
-
-To call a tool, write: <tool_call>tool_name(args)</tool_call>
-
-After any tool analysis, output your final decision as JSON:
-```json
-{{"movement": {{"src": "YourTerritory", "target": "YourTerritory", "count": N}}}}
-```
-
-Or to skip movement:
-```json
-{{"movement": null}}
-```
-
-Rules:
-- Both src and target must be territories you own
-- src and target must be adjacent
-- count must be between 1 and (src troops - 1) — you must leave at least 1 troop behind"""
+from llm_player.decision_menus import (
+    build_reinforce_prompt,
+    build_attack_menu,
+    build_attack_prompt,
+    map_attack_decisions_to_indices,
+)
 
 
 # ── Logging wrapper for BetterAI ─────────────────────────────────────
@@ -144,7 +40,7 @@ class LoggingBetterAI(BetterAI):
         self.turn_log = []
 
     def _snapshot(self):
-        """Create board snapshot matching BenchmarkLLMPlayer format."""
+        """Create board snapshot dict from live game state."""
         player = self.player
         game = self.game
 
@@ -156,7 +52,6 @@ class LoggingBetterAI(BetterAI):
 
         territory_map = {}
         for name, t in game.world.territories.items():
-            # Find continent
             continent = "Unknown"
             for area in game.world.areas.values():
                 if t in area.territories:
@@ -169,13 +64,11 @@ class LoggingBetterAI(BetterAI):
                 "adjacent": [adj.name for adj in t.connect],
             }
 
-        # Detect controlled continents
         continents = []
         for area in game.world.areas.values():
             if all(t.owner == player for t in area.territories):
                 continents.append(area.name)
 
-        # Players info
         players = {}
         for pname, p in game.players.items():
             p_territories = [t for t in game.world.territories.values()
@@ -203,18 +96,12 @@ class LoggingBetterAI(BetterAI):
             "turn": game.turn,
         }
 
-    def _board_summary(self):
-        """Get serialized board state text (same as LLM prompt)."""
-        return serialize_game_state(self.game, self.player)
-
     def reinforce(self, available):
         snapshot = self._snapshot()
         snapshot["reinforcements"] = available
-        board_summary = self._board_summary()
 
         result = super().reinforce(available)
 
-        # Convert Territory objects to names
         named = {}
         for t, count in result.items():
             name = t.name if hasattr(t, 'name') else str(t)
@@ -225,7 +112,6 @@ class LoggingBetterAI(BetterAI):
             "phase": "reinforcements",
             "decision": named,
             "board_snapshot": snapshot,
-            "board_summary": board_summary,
             "available": available,
         })
 
@@ -233,7 +119,6 @@ class LoggingBetterAI(BetterAI):
 
     def attack(self):
         snapshot = self._snapshot()
-        board_summary = self._board_summary()
 
         attacks_list = list(super().attack())
 
@@ -254,7 +139,6 @@ class LoggingBetterAI(BetterAI):
             "phase": "attacks",
             "decision": attack_decisions,
             "board_snapshot": snapshot,
-            "board_summary": board_summary,
         })
 
         for attack in attacks_list:
@@ -262,8 +146,6 @@ class LoggingBetterAI(BetterAI):
 
     def freemove(self):
         snapshot = self._snapshot()
-        board_summary = self._board_summary()
-
         result = super().freemove()
 
         if result:
@@ -281,30 +163,23 @@ class LoggingBetterAI(BetterAI):
             "phase": "movement",
             "decision": movement,
             "board_snapshot": snapshot,
-            "board_summary": board_summary,
         })
 
         return result
 
 
 class LoggingChronAI(ChronAI):
-    """ChronAI wrapper that logs decisions and board snapshots.
-
-    Reuses the same _snapshot and _board_summary methods as LoggingBetterAI.
-    """
+    """ChronAI wrapper that logs decisions and board snapshots."""
 
     def start(self):
         super().start()
         self.turn_log = []
 
-    # Reuse snapshot/summary from LoggingBetterAI
     _snapshot = LoggingBetterAI._snapshot
-    _board_summary = LoggingBetterAI._board_summary
 
     def reinforce(self, available):
         snapshot = self._snapshot()
         snapshot["reinforcements"] = available
-        board_summary = self._board_summary()
 
         result = super().reinforce(available)
 
@@ -318,7 +193,6 @@ class LoggingChronAI(ChronAI):
             "phase": "reinforcements",
             "decision": named,
             "board_snapshot": snapshot,
-            "board_summary": board_summary,
             "available": available,
         })
 
@@ -326,7 +200,6 @@ class LoggingChronAI(ChronAI):
 
     def attack(self):
         snapshot = self._snapshot()
-        board_summary = self._board_summary()
 
         attacks_list = list(super().attack())
 
@@ -347,7 +220,6 @@ class LoggingChronAI(ChronAI):
             "phase": "attacks",
             "decision": attack_decisions,
             "board_snapshot": snapshot,
-            "board_summary": board_summary,
         })
 
         for attack in attacks_list:
@@ -355,8 +227,6 @@ class LoggingChronAI(ChronAI):
 
     def freemove(self):
         snapshot = self._snapshot()
-        board_summary = self._board_summary()
-
         result = super().freemove()
 
         if result:
@@ -374,293 +244,78 @@ class LoggingChronAI(ChronAI):
             "phase": "movement",
             "decision": movement,
             "board_snapshot": snapshot,
-            "board_summary": board_summary,
         })
 
         return result
 
 
-# ── Tool call + result generation ────────────────────────────────────
+# ── Bridge text generators ───────────────────────────────────────────
 
-def build_tool_prefix_reinforcements(snapshot):
-    """Generate threat_analyzer() call + result."""
-    try:
-        threats = analyze_threats_from_snapshot(snapshot)
-    except Exception:
-        return None
-    if not threats:
-        return None
-    call = "<tool_call>threat_analyzer()</tool_call>"
-    result_text = _format_result(threats[:5])
-    return f"{call}\n<tool_result>\n{result_text}\n</tool_result>"
-
-
-def build_tool_prefix_attacks(attacks, snapshot):
-    """Generate battle_sim() or threat_analyzer() call + result."""
-    if attacks:
-        first = attacks[0]
-        territory_map = snapshot.get("territory_map", {})
-        src_forces = territory_map.get(first["src"], {}).get("forces", 0)
-        tgt_forces = territory_map.get(first["target"], {}).get("forces", 0)
-        if src_forces > 1 and tgt_forces > 0:
-            try:
-                sim_result = simulate_battle(src_forces, tgt_forces,
-                                             num_simulations=1000)
-                call = (f"<tool_call>battle_sim(attacking={src_forces}, "
-                        f"defending={tgt_forces})</tool_call>")
-                result_text = _format_result(sim_result)
-                return f"{call}\n<tool_result>\n{result_text}\n</tool_result>"
-            except Exception:
-                pass
-    # Fallback: threat_analyzer
-    try:
-        threats = analyze_threats_from_snapshot(snapshot)
-    except Exception:
-        return None
-    if not threats:
-        return None
-    call = "<tool_call>threat_analyzer()</tool_call>"
-    result_text = _format_result(threats[:5])
-    return f"{call}\n<tool_result>\n{result_text}\n</tool_result>"
-
-
-def build_tool_prefix_movement(snapshot):
-    """Generate position_evaluator() call + result."""
-    try:
-        position = evaluate_position_from_snapshot(snapshot)
-    except Exception:
-        return None
-    if not position:
-        return None
-    call = "<tool_call>position_evaluator()</tool_call>"
-    result_text = _format_result(position)
-    return f"{call}\n<tool_result>\n{result_text}\n</tool_result>"
-
-
-# ── Strategic bridge generation ──────────────────────────────────────
-
-def _get_continent_progress(snapshot):
-    """Get continent progress from snapshot."""
-    territory_map = snapshot["territory_map"]
-    player_name = snapshot["player_name"]
-
-    BONUSES = {
-        "Africa": 3, "Asia": 7, "Australia": 2,
-        "Europe": 5, "North America": 5, "South America": 2,
-    }
-
-    continents = {}
-    for name, info in territory_map.items():
-        cont = info.get("continent", "Unknown")
-        if cont not in continents:
-            continents[cont] = {
-                "name": cont, "total": 0, "owned": 0,
-                "bonus": BONUSES.get(cont, 0), "missing": [],
-            }
-        continents[cont]["total"] += 1
-        if info.get("owner") == player_name:
-            continents[cont]["owned"] += 1
-        else:
-            continents[cont]["missing"].append(name)
-
-    for c in continents.values():
-        c["remaining"] = c["total"] - c["owned"]
-
-    return list(continents.values())
-
-
-def bridge_reinforcements(decision, snapshot):
-    """2-3 sentence strategic bridge for reinforcement decision."""
-    territory_map = snapshot["territory_map"]
-    borders = set(snapshot["border_territories"])
-    continent_info = _get_continent_progress(snapshot)
+def hybrid_bridge_reinforce(decision, snapshot):
+    """1-2 sentence reasoning for reinforcement decision."""
+    borders = set(snapshot.get("border_territories", []))
+    territory_map = snapshot.get("territory_map", {})
+    player_name = snapshot.get("player_name", "LLM")
 
     targets = list(decision.keys())
-    border_targets = [t for t in targets if t in borders]
 
+    if not targets:
+        return "No troops to place."
+
+    main_target = max(targets, key=lambda t: decision[t])
+    main_count = decision[main_target]
+
+    if main_target in borders:
+        info = territory_map.get(main_target, {})
+        enemy_forces = []
+        for adj in info.get("adjacent", []):
+            adj_info = territory_map.get(adj, {})
+            if adj_info.get("owner") and adj_info["owner"] != player_name:
+                enemy_forces.append(f"{adj}({adj_info.get('forces', 0)})")
+        if enemy_forces:
+            return (f"Concentrating {main_count} troops on {main_target} "
+                    f"which borders {', '.join(enemy_forces[:2])}.")
+
+    if len(targets) == 1:
+        return f"Placing all {main_count} troops on {main_target} for concentration."
+    return (f"Reinforcing {main_target} with {main_count} troops "
+            f"and spreading remainder across {len(targets)-1} other territories.")
+
+
+def hybrid_bridge_attack(indices, menu):
+    """1-2 sentence reasoning for attack decision."""
+    if not indices:
+        return "No attacks with good enough odds this turn."
+
+    chosen = [menu[i - 1] for i in indices]
+    first = chosen[0]
+    src_f = first["src_forces"]
+    tgt_f = first["tgt_forces"]
+
+    if len(chosen) == 1:
+        return (f"Attacking {first['target']} from {first['src']} "
+                f"with {src_f} vs {tgt_f} troops.")
+    return (f"Launching {len(chosen)} attacks, starting with "
+            f"{first['src']} ({src_f}) -> {first['target']} ({tgt_f}).")
+
+
+def build_hybrid_completion(phase, decision, snapshot, menu=None, indices=None):
+    """Build synthetic completion: bridge text + JSON."""
     parts = []
 
-    # Mention continent strategy
-    near_complete = [c for c in continent_info
-                     if 0 < c["remaining"] <= 2]
-    complete = [c for c in continent_info if c["remaining"] == 0]
-
-    if complete:
-        c = complete[0]
-        parts.append(f"I control {c['name']} (+{c['bonus']} bonus).")
-    if near_complete:
-        c = near_complete[0]
-        parts.append(
-            f"{c['name']} is {c['owned']}/{c['total']} — "
-            f"need {c['remaining']} more for +{c['bonus']} bonus."
-        )
-
-    # Mention border defense
-    if border_targets:
-        max_threat = 0
-        most_threatened = border_targets[0]
-        for t in border_targets:
-            info = territory_map.get(t, {})
-            enemy_adj = sum(
-                territory_map.get(adj, {}).get("forces", 0)
-                for adj in info.get("adjacent", [])
-                if territory_map.get(adj, {}).get("owner") != snapshot["player_name"]
-                and territory_map.get(adj, {}).get("owner") is not None
-            )
-            if enemy_adj > max_threat:
-                max_threat = enemy_adj
-                most_threatened = t
-        parts.append(
-            f"Reinforcing {most_threatened} which faces "
-            f"{max_threat} enemy troops adjacent."
-        )
-    else:
-        parts.append("Concentrating troops on key positions.")
-
-    return " ".join(parts) if parts else "Reinforcing priority territories."
-
-
-def bridge_attacks(attacks, snapshot):
-    """2-3 sentence strategic bridge for attack decision."""
-    if not attacks:
-        return "No attacks with sufficient force advantage this turn."
-
-    territory_map = snapshot["territory_map"]
-    continent_info = _get_continent_progress(snapshot)
-
-    first = attacks[0]
-    src_forces = territory_map.get(first["src"], {}).get("forces", 0)
-    tgt_forces = territory_map.get(first["target"], {}).get("forces", 0)
-
-    parts = []
-
-    # Check if attack completes a continent
-    target_continent = territory_map.get(first["target"], {}).get("continent", "")
-    for c in continent_info:
-        if c["name"] == target_continent and c["remaining"] == 1:
-            parts.append(
-                f"Taking {first['target']} completes {c['name']} "
-                f"for +{c['bonus']} bonus."
-            )
-            break
-
-    ratio_str = f"{src_forces} vs {tgt_forces}"
-    if src_forces > tgt_forces * 2:
-        parts.append(
-            f"Attacking {first['target']} from {first['src']} "
-            f"({ratio_str}) — overwhelming advantage."
-        )
-    elif src_forces > tgt_forces:
-        parts.append(
-            f"Attacking {first['target']} from {first['src']} "
-            f"({ratio_str}) — favorable odds."
-        )
-    else:
-        parts.append(
-            f"Attacking {first['target']} from {first['src']} "
-            f"({ratio_str})."
-        )
-
-    if len(attacks) > 1:
-        n = len(attacks) - 1
-        parts.append(f"Also targeting {n} more position{'s' if n > 1 else ''}.")
-
-    return " ".join(parts)
-
-
-def bridge_movement(movement, snapshot):
-    """2-3 sentence strategic bridge for movement decision."""
-    if movement is None:
-        borders = set(snapshot["border_territories"])
-        owned = set(snapshot["owned_territories"])
-        inland = owned - borders
-        if not inland:
-            return "All territories are on the border. No useful movement available."
-        return "Current positions are adequate. No movement needed."
-
-    borders = set(snapshot["border_territories"])
-    src = movement["src"]
-    target = movement["target"]
-    count = movement["count"]
-
-    src_is_border = src in borders
-    tgt_is_border = target in borders
-
-    if not src_is_border and tgt_is_border:
-        return (
-            f"Moving {count} troops from {src} (interior) to "
-            f"{target} (border) to strengthen defenses."
-        )
-    elif src_is_border and tgt_is_border:
-        return (
-            f"Redistributing {count} troops from {src} to "
-            f"{target} to balance border defenses."
-        )
-    else:
-        return f"Moving {count} troops from {src} to {target} to consolidate forces."
-
-
-# ── Completion builder ───────────────────────────────────────────────
-
-def build_completion(phase, decision, snapshot):
-    """Build synthetic completion: tool call + strategic bridge + JSON."""
-    parts = []
-
-    # 1. Tool call + result
     if phase == "reinforcements":
-        tool = build_tool_prefix_reinforcements(snapshot)
-    elif phase == "attacks":
-        tool = build_tool_prefix_attacks(decision, snapshot)
-    elif phase == "movement":
-        tool = build_tool_prefix_movement(snapshot)
-    else:
-        tool = None
-
-    if tool:
-        parts.append(tool)
-
-    # 2. Strategic bridge (2-3 sentences)
-    if phase == "reinforcements":
-        bridge = bridge_reinforcements(decision, snapshot)
-    elif phase == "attacks":
-        bridge = bridge_attacks(decision, snapshot)
-    elif phase == "movement":
-        bridge = bridge_movement(decision, snapshot)
-    else:
-        bridge = ""
-
-    if bridge:
-        parts.append(bridge)
-
-    # 3. JSON decision
-    if phase == "reinforcements":
+        bridge = hybrid_bridge_reinforce(decision, snapshot)
         json_data = {"reinforcements": decision}
     elif phase == "attacks":
-        json_data = {"attacks": decision if decision else []}
-    elif phase == "movement":
-        json_data = {"movement": decision}
+        bridge = hybrid_bridge_attack(indices or [], menu or [])
+        json_data = {"attacks": indices or []}
     else:
-        json_data = {}
+        return ""
 
-    json_str = json.dumps(json_data, indent=2)
+    parts.append(bridge)
+    json_str = json.dumps(json_data)
     parts.append(f"```json\n{json_str}\n```")
-
     return "\n\n".join(parts)
-
-
-# ── Prompt builder ───────────────────────────────────────────────────
-
-def build_prompt(phase, board_summary, available=None):
-    """Build the prompt the LLM would see for this phase."""
-    if phase == "reinforcements":
-        return REINFORCEMENT_PROMPT.format(
-            board_summary=board_summary, available=available
-        )
-    elif phase == "attacks":
-        return ATTACK_PROMPT.format(board_summary=board_summary)
-    elif phase == "movement":
-        return MOVEMENT_PROMPT.format(board_summary=board_summary)
-    return ""
 
 
 # ── Game running ─────────────────────────────────────────────────────
@@ -687,16 +342,13 @@ def run_game(ai_class, seed=None):
     return winner, llm_player
 
 
-# ── Main ─────────────────────────────────────────────────────────────
+# ── Data collection ──────────────────────────────────────────────────
 
-def collect(num_games, output_path, ai_names, seed=42):
-    """Run games and convert decisions to SFT training data.
+def collect_hybrid(num_games, output_path, ai_names, seed=42):
+    """Run games and convert decisions to hybrid SFT training data.
 
-    Args:
-        num_games: games per AI type.
-        output_path: where to write turns.jsonl.
-        ai_names: list of AI names to use (e.g. ["better", "chron"]).
-        seed: random seed.
+    Only generates reinforcement + attack entries (no placement/movement).
+    Uses menu-based prompts from decision_menus.py.
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
@@ -704,8 +356,7 @@ def collect(num_games, output_path, ai_names, seed=42):
     stats = {
         "games": 0, "wins": 0,
         "reinforcements": 0, "attacks": 0, "attacks_real": 0,
-        "attacks_empty": 0, "movement": 0, "movement_real": 0,
-        "movement_null": 0, "tool_prefixes": 0,
+        "attacks_empty": 0,
     }
 
     for ai_name in ai_names:
@@ -713,7 +364,8 @@ def collect(num_games, output_path, ai_names, seed=42):
         print(f"\n--- {ai_name.upper()} AI ({num_games} games) ---")
 
         for i in range(num_games):
-            game_seed = seed + i + (1000 if ai_name == "chron" else 0)
+            seed_offset = {"better": 0, "chron": 1000}.get(ai_name, 0)
+            game_seed = seed + i + seed_offset
             try:
                 winner, llm_player = run_game(ai_class, seed=game_seed)
             except Exception as e:
@@ -731,48 +383,58 @@ def collect(num_games, output_path, ai_names, seed=42):
             print(f"  Game {i+1:>3}/{num_games}: {status:<4} "
                   f"({n_decisions} decisions)")
 
-            # Convert each decision to a training entry
             for entry in llm_player.ai.turn_log:
                 phase = entry["phase"]
                 decision = entry["decision"]
                 snapshot = entry["board_snapshot"]
-                board_summary = entry["board_summary"]
 
-                # Build prompt (same as LLM would see)
-                available = entry.get("available")
-                prompt = build_prompt(phase, board_summary, available)
-
-                # Build synthetic completion
-                response = build_completion(phase, decision, snapshot)
-
-                # Track stats
                 if phase == "reinforcements":
+                    available = entry.get("available", 3)
+                    prompt = build_reinforce_prompt(snapshot, available)
+                    completion = build_hybrid_completion(
+                        phase, decision, snapshot)
+
                     stats["reinforcements"] += 1
+                    all_entries.append({
+                        "prompt": prompt,
+                        "response": completion,
+                        "phase": phase,
+                        "board_snapshot": snapshot,
+                        "available": available,
+                        "outcome": outcome,
+                        "data_source": f"heuristic_{ai_name}",
+                    })
+
                 elif phase == "attacks":
+                    menu = build_attack_menu(snapshot)
+
+                    if not menu:
+                        prompt = build_attack_prompt(snapshot, [])
+                        indices = []
+                    else:
+                        indices = map_attack_decisions_to_indices(
+                            decision, menu)
+                        prompt = build_attack_prompt(snapshot, menu)
+
+                    completion = build_hybrid_completion(
+                        phase, decision, snapshot,
+                        menu=menu, indices=indices)
+
                     stats["attacks"] += 1
-                    if decision:
+                    if indices:
                         stats["attacks_real"] += 1
                     else:
                         stats["attacks_empty"] += 1
-                elif phase == "movement":
-                    stats["movement"] += 1
-                    if decision:
-                        stats["movement_real"] += 1
-                    else:
-                        stats["movement_null"] += 1
 
-                if "<tool_call>" in response:
-                    stats["tool_prefixes"] += 1
-
-                all_entries.append({
-                    "prompt": prompt,
-                    "response": response,
-                    "phase": phase,
-                    "board_snapshot": snapshot,
-                    "outcome": outcome,
-                    "fallback": False,
-                    "data_source": f"heuristic_{ai_name}",
-                })
+                    all_entries.append({
+                        "prompt": prompt,
+                        "response": completion,
+                        "phase": phase,
+                        "board_snapshot": snapshot,
+                        "attack_menu": menu,
+                        "outcome": outcome,
+                        "data_source": f"heuristic_{ai_name}",
+                    })
 
     # Write output
     with open(output_path, "w") as f:
@@ -781,19 +443,15 @@ def collect(num_games, output_path, ai_names, seed=42):
 
     # Print stats
     win_rate = stats["wins"] / stats["games"] if stats["games"] else 0
-    print(f"\n=== Heuristic Data Collection ===")
+    print(f"\n=== Data Collection ===")
     print(f"Games:          {stats['games']} ({stats['wins']} wins, "
           f"{win_rate:.0%} win rate)")
     print(f"Total entries:  {len(all_entries)}")
     print(f"  Reinforcements: {stats['reinforcements']}")
     print(f"  Attacks:        {stats['attacks']} "
           f"({stats['attacks_real']} real, {stats['attacks_empty']} empty)")
-    print(f"  Movement:       {stats['movement']} "
-          f"({stats['movement_real']} real, {stats['movement_null']} null)")
-    print(f"  Tool prefixes:  {stats['tool_prefixes']}")
     print(f"Output:         {output_path}")
 
-    # Write summary
     summary_path = output_path.replace(".jsonl", "_summary.json")
     with open(summary_path, "w") as f:
         json.dump(stats, f, indent=2)
@@ -807,8 +465,8 @@ if __name__ == "__main__":
     parser.add_argument("--games", type=int, default=50,
                         help="Number of games per AI type (default: 50)")
     parser.add_argument("--output", type=str,
-                        default="data/heuristic_results/turns.jsonl",
-                        help="Output path (default: data/heuristic_results/turns.jsonl)")
+                        default="data/hybrid_data/turns.jsonl",
+                        help="Output path (default: data/hybrid_data/turns.jsonl)")
     parser.add_argument("--ai", type=str, default="both",
                         choices=["better", "chron", "both"],
                         help="Which AI to use (default: both)")
@@ -821,4 +479,4 @@ if __name__ == "__main__":
     else:
         ai_names = [args.ai]
 
-    collect(args.games, args.output, ai_names, args.seed)
+    collect_hybrid(args.games, args.output, ai_names, args.seed)
