@@ -78,7 +78,8 @@ def load_dataset_sft(paths, max_examples=None, wins_only=False):
     if max_examples:
         examples = examples[:max_examples]
 
-    return HFDataset.from_list(examples)
+    dataset = HFDataset.from_list(examples)
+    return dataset
 
 
 # ── Main ──────────────────────────────────────────────────────────────
@@ -111,6 +112,10 @@ def main():
                         help="Save checkpoint every N steps (default: 50)")
     parser.add_argument("--resume-from", type=str, default=None,
                         help="Path to PEFT adapter to continue training")
+    parser.add_argument("--val-split", type=float, default=0.05,
+                        help="Validation split fraction (default: 0.05)")
+    parser.add_argument("--eval-steps", type=int, default=50,
+                        help="Evaluate every N steps (default: 50)")
     parser.add_argument("--wins-only", action="store_true",
                         help="Only train on decisions from winning games")
     parser.add_argument("--cpu", action="store_true",
@@ -145,9 +150,14 @@ def main():
 
     # Load dataset
     print("Loading dataset...")
-    dataset = load_dataset_sft(args.data, max_examples=args.max_examples,
-                               wins_only=args.wins_only)
-    print(f"Dataset: {len(dataset)} examples")
+    full_dataset = load_dataset_sft(args.data, max_examples=args.max_examples,
+                                    wins_only=args.wins_only)
+
+    # Train/val split
+    split = full_dataset.train_test_split(test_size=args.val_split, seed=42)
+    train_dataset = split["train"]
+    eval_dataset = split["test"]
+    print(f"Dataset: {len(train_dataset)} train, {len(eval_dataset)} val")
     print()
 
     # Configure SFT trainer
@@ -162,6 +172,8 @@ def main():
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         max_seq_length=args.max_seq_length,
+        eval_strategy="steps",
+        eval_steps=args.eval_steps,
     )
     if args.cpu:
         config_kwargs.update(bf16=False, fp16=False, no_cuda=True)
@@ -176,7 +188,8 @@ def main():
     trainer = SFTTrainer(
         model=model,
         args=config,
-        train_dataset=dataset,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         processing_class=tokenizer,
         formatting_func=formatting_func,
     )
