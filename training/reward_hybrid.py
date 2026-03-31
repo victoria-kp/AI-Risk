@@ -5,8 +5,7 @@ No tool calling — rewards are based purely on JSON quality and strategic merit
 
 Weight history:
   v1 (original):  50% format / 50% strategy  — used for GRPO v1
-  v2:             25% format / 75% strategy  — used for GRPO v2, v3
-  v3 (current):   10% format / 90% strategy  — used for GRPO v4
+  v2 (current):   25% format / 75% strategy  — used for GRPO v2, v3
 """
 
 import json
@@ -22,15 +21,12 @@ def compute_reinforce_reward(completion: str,
     """Score a reinforcement completion.
 
     Components (sum to 1.0):
-      0.05  JSON validity — valid JSON with "reinforcements" dict
-      0.05  Correctness — troops sum to available, all territories owned
-      0.35  Concentration — penalize spreading across 4+ territories
-      0.30  Border placement — fraction of troops on border territories
-      0.25  Continent completion — reward reinforcing near completable continents
+      0.15  JSON validity — valid JSON with "reinforcements" dict
+      0.10  Correctness — troops sum to available, all territories owned
+      0.30  Concentration — penalize spreading across 4+ territories
+      0.25  Border placement — fraction of troops on border territories
+      0.20  Continent completion — reward reinforcing near completable continents
 
-    Previous weights (v2: 25% format / 75% strategy):
-      # 0.15 JSON validity, 0.10 correctness, 0.30 concentration,
-      # 0.25 border, 0.20 continent
     Original weights (v1: 50% format / 50% strategy):
       # 0.25 JSON validity, 0.25 correctness, 0.30 concentration,
       # 0.20 border
@@ -47,15 +43,15 @@ def compute_reinforce_reward(completion: str,
     borders = set(board_snapshot.get("border_territories", []))
     score = 0.0
 
-    # Component 1: JSON validity (0.05)
+    # Component 1: JSON validity (0.15)
     reinf = _parse_reinforcements(completion)
     if reinf is None:
         if "reinforcements" in completion:
-            score += 0.02
+            score += 0.05
         return min(1.0, score)
-    score += 0.05
+    score += 0.15
 
-    # Component 2: Correctness (0.05)
+    # Component 2: Correctness (0.10)
     total_placed = 0
     valid_placed = 0
     for territory, count in reinf.items():
@@ -74,9 +70,9 @@ def compute_reinforce_reward(completion: str,
             sum_score = total_placed / available
         else:
             sum_score = max(0.0, 1.0 - (total_placed - available) / available)
-        score += 0.05 * (0.5 * validity_frac + 0.5 * sum_score)
+        score += 0.10 * (0.5 * validity_frac + 0.5 * sum_score)
 
-    # Component 3: Concentration (0.35)
+    # Component 3: Concentration (0.30)
     n_territories = len([t for t, c in reinf.items()
                          if isinstance(c, (int, float)) and int(c) > 0])
     if n_territories == 0:
@@ -89,19 +85,19 @@ def compute_reinforce_reward(completion: str,
         concentration = 0.3
     else:
         concentration = 0.0  # spreading across 4+ is terrible
-    score += 0.35 * concentration
+    score += 0.30 * concentration
 
-    # Component 4: Border placement (0.30)
+    # Component 4: Border placement (0.25)
     if valid_placed > 0:
         border_placed = sum(
             int(reinf.get(t, 0)) for t in borders if t in reinf
         )
         border_frac = border_placed / valid_placed
-        score += 0.30 * border_frac
+        score += 0.25 * border_frac
 
-    # Component 5: Continent completion (0.25)
+    # Component 5: Continent completion (0.20)
     continent_score = _continent_reinforce_score(reinf, board_snapshot)
-    score += 0.25 * continent_score
+    score += 0.20 * continent_score
 
     return min(1.0, max(0.0, score))
 
@@ -162,15 +158,12 @@ def compute_attack_reward(completion: str,
     """Score an attack completion.
 
     Components (sum to 1.0):
-      0.05  JSON validity — valid JSON with "attacks" list of ints
-      0.05  Index validity — all indices in range [1, menu_size]
-      0.35  Attack quality — troop ratios with steeper curve
-      0.20  Activity bonus — reward attacking when good options exist
-      0.35  Continent targeting — reward attacks that help complete continents
+      0.15  JSON validity — valid JSON with "attacks" list of ints
+      0.10  Index validity — all indices in range [1, menu_size]
+      0.30  Attack quality — troop ratios with steeper curve
+      0.15  Activity bonus — reward attacking when good options exist
+      0.30  Continent targeting — reward attacks that help complete continents
 
-    Previous weights (v2: 25% format / 75% strategy):
-      # 0.15 JSON validity, 0.10 index validity, 0.30 quality,
-      # 0.15 activity, 0.30 continent
     Original weights (v1: 50% format / 50% strategy):
       # 0.25 JSON validity, 0.25 index validity, 0.30 quality,
       # 0.20 activity
@@ -186,23 +179,23 @@ def compute_attack_reward(completion: str,
     menu_size = len(attack_menu)
     score = 0.0
 
-    # Component 1: JSON validity (0.05)
+    # Component 1: JSON validity (0.15)
     indices = _parse_attack_indices(completion)
     if indices is None:
         if "attacks" in completion:
-            score += 0.02
+            score += 0.05
         return min(1.0, score)
-    score += 0.05
+    score += 0.15
 
-    # Component 2: Index validity (0.05)
+    # Component 2: Index validity (0.10)
     if len(indices) == 0:
-        score += 0.05
+        score += 0.10
     else:
         valid = [i for i in indices if 1 <= i <= menu_size]
-        score += 0.05 * (len(valid) / len(indices))
+        score += 0.10 * (len(valid) / len(indices))
         indices = valid
 
-    # Component 3: Attack quality (0.35) — steeper curve
+    # Component 3: Attack quality (0.30) — steeper curve
     if indices:
         ratios = []
         for idx in indices:
@@ -223,9 +216,9 @@ def compute_attack_reward(completion: str,
             quality = 0.3
         else:
             quality = 0.0  # attacking at bad odds is punished
-        score += 0.35 * quality
+        score += 0.30 * quality
 
-    # Component 4: Activity bonus (0.20)
+    # Component 4: Activity bonus (0.15)
     if menu_size > 0:
         best_ratio = max(
             opt["src_forces"] / max(opt["tgt_forces"], 1)
@@ -233,18 +226,18 @@ def compute_attack_reward(completion: str,
         )
         if best_ratio >= 3.0:
             # Great options exist: strongly reward attacking, punish passivity
-            score += 0.20 if indices else 0.0
+            score += 0.15 if indices else 0.0
         elif best_ratio >= 2.0:
-            score += 0.15 if indices else 0.03
+            score += 0.12 if indices else 0.03
         else:
             # Only bad options: skipping is fine
-            score += 0.10 if not indices else 0.13
+            score += 0.08 if not indices else 0.10
     else:
-        score += 0.20
+        score += 0.15
 
-    # Component 5: Continent targeting (0.35)
+    # Component 5: Continent targeting (0.30)
     continent_score = _continent_attack_score(indices, attack_menu, board_snapshot)
-    score += 0.35 * continent_score
+    score += 0.30 * continent_score
 
     return min(1.0, max(0.0, score))
 
