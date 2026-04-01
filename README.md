@@ -101,6 +101,12 @@ The reward function (`training/reward_hybrid.py`) scores each decision with **25
 
 Since SFT already teaches the model to produce correct JSON, the reward function weights strategy much more heavily than format.
 
+### Weights & Biases
+
+Training metrics were synced to W&B after the training runs to confirm the logs in the Jupyter notebook: [W&B Project Dashboard](https://wandb.ai/1victoriakp-1/AI-Risk/overview)
+
+The KL divergence in the first GRPO output (GRPO v1) was large, indicating the policy drifted significantly from the reference model. In GRPO v3, the KL divergence is under control, showing the model improved its strategy without diverging too far from the base policy.
+
 ## Results
 
 Results obtained by running `python analysis/compare_results.py --reward`. Each model played 20 games against 2 StupidAI opponents.
